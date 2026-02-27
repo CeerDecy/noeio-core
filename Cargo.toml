@@ -1,0 +1,11 @@
+[workspace]
+members = ["noeio","noeio-client","noeio-server"]
+
+[workspace.dependencies]
+axum = "0.8.8"
+tokio = { version = "1.49.0", features = ["full"] }
+boringtun = "0.7"
+x25519-dalek = "2.0.1"
+tun = "0.8.5"
+clap = "4"
+tracing = "0.1.44"

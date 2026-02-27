@@ -1,0 +1,18 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+
+# Local environment
+.env
+.env.*
+!.env.example
+.direnv/

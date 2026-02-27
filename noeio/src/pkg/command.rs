@@ -1,0 +1,21 @@
+use tokio::process::Command;
+
+pub async fn run_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cmd_out: std::process::Output;
+    let stdout: String;
+    let stderr: String;
+    {
+        cmd_out = Command::new("sh").arg("-c").arg(cmd).output().await?;
+        stdout = String::from_utf8_lossy(cmd_out.stdout.as_slice()).to_string();
+        stderr = String::from_utf8_lossy(cmd_out.stderr.as_slice()).to_string();
+    };
+
+    let ec = cmd_out.status.code();
+    let succ = cmd_out.status.success();
+    tracing::info!(?cmd, ?ec, ?succ, ?stdout, ?stderr, "run shell cmd");
+
+    if !cmd_out.status.success() {
+        return Err(format!("{} {}", stdout, &stderr).into());
+    }
+    Ok(())
+}
