@@ -11,4 +11,5 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Boot,
+    Stun,
 }

@@ -5,9 +5,13 @@ edition = "2024"
 
 [dependencies]
 tun = { workspace = true, features = ["async"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 clap = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 pnet = "0.35.0"
 x25519-dalek = { workspace = true, features = ["getrandom"] }
 boringtun = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+stun_codec = { workspace = true }
+rand = { workspace = true, features = ["std"] }
+bytecodec = { workspace = true }

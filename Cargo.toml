@@ -1,5 +1,5 @@
 [workspace]
-members = ["noeio","noeio-client","noeio-server"]
+members = ["noeio"]
 
 [workspace.dependencies]
 axum = "0.8.8"
@@ -9,3 +9,7 @@ x25519-dalek = "2.0.1"
 tun = "0.8.5"
 clap = "4"
 tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+stun_codec = "0.4.0"
+rand = "0.10.0"
+bytecodec = "0.5.0"
