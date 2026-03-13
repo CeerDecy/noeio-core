@@ -4,13 +4,13 @@ use tokio::task::JoinSet;
 use noeio_common::packet::NoeioPacket;
 
 pub struct PacketManager {
-    pub sender: Sender<Vec<u8>>,
+    pub sender: Sender<NoeioPacket>,
     pub shutdown: watch::Receiver<bool>,
     pub task: JoinSet<()>,
 }
 
 impl PacketManager {
-    pub fn new(sender: Sender<Vec<u8>>, shutdown: watch::Receiver<bool>) -> Self {
+    pub fn new(sender: Sender<NoeioPacket>, shutdown: watch::Receiver<bool>) -> Self {
         let task: JoinSet<()> = JoinSet::new();
 
         let mut manager = PacketManager {
@@ -45,11 +45,9 @@ impl PacketManager {
                             }
                         };
 
-                        let noeio_packet = NoeioPacket::from(payload);
+                        tracing::info!("received packet: {:?}", payload);
 
-                        tracing::info!("received packet: {:?}", noeio_packet);
-
-                        if let Some(header) = noeio_packet.parse_header() {
+                        if let Some(header) = payload.parse_header() {
                             tracing::info!("parsed header: {:?}", header);
                         }
                     }

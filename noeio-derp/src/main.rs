@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::cli::{Cli, Command};
 use crate::packet::PacketManager;
 use clap::Parser;
@@ -9,6 +10,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use noeio_common::packet::{NoeioPacket, NoeioPacketType};
 
 mod cli;
 mod connection;
@@ -27,7 +29,7 @@ async fn main() {
 
     match cli.command {
         Command::Boot => {
-            let (sender, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+            let (sender, _) = tokio::sync::broadcast::channel::<NoeioPacket>(1);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             tracing::info!("Starting UDP server on 0.0.0.0:8080");
@@ -61,10 +63,15 @@ async fn main() {
 
 fn handle_udp_connection(
     udp: Arc<UdpSocket>,
-    sender: Sender<Vec<u8>>,
+    sender: Sender<NoeioPacket>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+
+        // temp
+        let mut releation = vec![];
+
+
         let mut buf = [0; 2048];
         loop {
             tokio::select! {
@@ -75,7 +82,7 @@ fn handle_udp_connection(
                     }
                 }
                 recv_result = udp.recv_from(&mut buf) => {
-                    let (size, _) = match recv_result {
+                    let (size, addr) = match recv_result {
                         Ok(v) => v,
                         Err(err) => {
                             tracing::error!("failed to receive udp packet: {}", err);
@@ -83,12 +90,30 @@ fn handle_udp_connection(
                         }
                     };
                     let data = buf[..size].to_vec();
-                    if let Err(err) = sender.send(data) {
-                        if *shutdown.borrow() {
-                            break;
+                    let packet = NoeioPacket::from(data.clone());
+                    if packet.packet_type == NoeioPacketType::Ping {
+                        if releation.len() < 2 {
+                            if !releation.contains(&addr.clone()) {
+                                releation.push(addr);
+                            }
                         }
-                        tracing::error!("Error sending data: {:?}", err);
                     }
+
+                    if releation.len() == 2 && packet.packet_type == NoeioPacketType::Forward {
+                        let mut forward = releation[0].clone();
+                        if addr == releation[0] {
+                            forward = releation[1].clone();
+                        }
+                        udp.send_to(&buf[..size], forward).await.unwrap();
+                    }
+
+
+                    // if let Err(err) = sender.send(packet) {
+                    //     if *shutdown.borrow() {
+                    //         break;
+                    //     }
+                    //     tracing::error!("Error sending data: {:?}", err);
+                    // }
                 }
             }
         }
