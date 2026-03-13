@@ -1,0 +1,11 @@
+[package]
+name = "noeio-derp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+noeio-common = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true, features = ["derive"] }

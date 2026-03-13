@@ -1,0 +1,68 @@
+use tokio::sync::broadcast::Sender;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use noeio_common::packet::NoeioPacket;
+
+pub struct PacketManager {
+    pub sender: Sender<Vec<u8>>,
+    pub shutdown: watch::Receiver<bool>,
+    pub task: JoinSet<()>,
+}
+
+impl PacketManager {
+    pub fn new(sender: Sender<Vec<u8>>, shutdown: watch::Receiver<bool>) -> Self {
+        let task: JoinSet<()> = JoinSet::new();
+
+        let mut manager = PacketManager {
+            sender,
+            shutdown,
+            task
+        };
+
+        manager.handle_recv();
+
+        manager
+    }
+
+    pub fn handle_recv(&mut self) {
+        let mut receiver = self.sender.subscribe();
+        let mut shutdown = self.shutdown.clone();
+        self.task.spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            tracing::info!("packet manager received shutdown signal");
+                            break;
+                        }
+                    }
+                    recv_result = receiver.recv() => {
+                        let payload = match recv_result {
+                            Ok(packet) => packet,
+                            Err(err) => {
+                                tracing::error!("failed to receive packet: {}", err);
+                                continue;
+                            }
+                        };
+
+                        let noeio_packet = NoeioPacket::from(payload);
+
+                        tracing::info!("received packet: {:?}", noeio_packet);
+
+                        if let Some(header) = noeio_packet.parse_header() {
+                            tracing::info!("parsed header: {:?}", header);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn shutdown(mut self) {
+        while let Some(result) = self.task.join_next().await {
+            if let Err(err) = result {
+                tracing::error!("packet manager task join error: {}", err);
+            }
+        }
+    }
+}
