@@ -15,7 +15,7 @@ impl WireguardTunnel {
     }
 
     pub async fn start(&mut self) {
-        let nic = VirtualNic::new().await;
+        let nic = VirtualNic::create().await;
 
     }
 }

@@ -3,14 +3,19 @@ use crate::pkg::stun;
 use boringtun::noise::{Tunn, TunnResult};
 use clap::Parser;
 use interface::virtual_nic::VirtualNic;
+use noeio_common::packet::{NoeioPacketType, PacketHeader};
 use pnet::packet::Packet;
 use pnet::packet::icmp::IcmpPacket;
 use pnet::packet::ipv4::Ipv4Packet;
 use std::io::Read;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tun::DeviceWriter;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 mod cli;
@@ -40,14 +45,12 @@ async fn main() {
 
             let mut tunn = Tunn::new(local_private, local_public, None, None, 1, None);
 
-            let nic = VirtualNic::new().await;
+            let nic = VirtualNic::create().await;
+            let (tun_writer, mut tun_reader) = nic.split().unwrap();
 
             let mut buf = vec![0u8; 4096];
             loop {
-                let n = {
-                    let mut tun_lock = nic.tun.lock().await;
-                    tun_lock.read(&mut buf).unwrap()
-                };
+                let n = tun_reader.read(&mut buf).await.unwrap();
 
                 let ipv4 = Ipv4Packet::new(&buf[4..n]).unwrap();
                 println!("src {:?}", ipv4.get_source());
@@ -80,5 +83,55 @@ async fn main() {
                 println!("{}", addr);
             }
         }
+        Command::OverlayTest => {
+            let conn = UdpSocket::bind("0.0.0.0:8000").await.unwrap();
+            let conn = Arc::new(conn);
+
+            let nic = VirtualNic::create().await;
+
+            let (tun_writer,mut tun_reader) = nic.split().unwrap();
+
+            handle_udp_connection(tun_writer, conn.clone());
+
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = tun_reader.read(&mut buf).await.unwrap();
+
+                tracing::debug!("Received packet, sending to overlay, {:?}", buf);
+
+                let header = PacketHeader {
+                    packet_type: NoeioPacketType::Forward,
+                    forward_ip: Ipv4Addr::new(110, 0, 0, 1),
+                    forward_port: 8000,
+                };
+                let header_bytes = header.to_bytes();
+                let mut payload = Vec::with_capacity(header_bytes.len() + n);
+                payload.extend_from_slice(&header_bytes);
+                payload.extend_from_slice(&buf[..n]);
+
+                tracing::debug!("payload: {:?}", payload);
+
+                if let Err(err) = conn.send_to(&payload, "129.226.135.14:8080").await {
+                    tracing::error!(%err, "overlay test send error");
+                }
+            }
+        }
     }
+}
+
+fn handle_udp_connection(mut writer: DeviceWriter, conn: Arc<UdpSocket>) {
+    tokio::spawn(async move {
+        loop {
+            let mut buf = vec![0u8; 4096];
+            match conn.recv_from(&mut buf).await {
+                Ok((n, addr)) => {
+                    tracing::debug!("Received packet, sending to overlay, {:?}", buf);
+                    writer.write(&buf[..n]).await.unwrap();
+                }
+                Err(err) => {
+                    tracing::error!(%err, "Error receiving data");
+                }
+            }
+        }
+    });
 }

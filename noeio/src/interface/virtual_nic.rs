@@ -1,26 +1,22 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
-use pnet::packet::icmp::IcmpPacket;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::Packet;
 use tokio::sync::Mutex;
 use crate::pkg::command::run_command;
-use tokio::time;
-use tun::{AbstractDevice, Layer};
+use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer};
 
 pub struct VirtualNic {
-    pub tun: Arc<Mutex<tun::Device>>,
+    pub tun: tun::AsyncDevice,
 }
 
 impl VirtualNic {
-    pub async fn new() -> VirtualNic {
-        let mut device = Self::create_tun().unwrap();
+    pub async fn create() -> VirtualNic {
+        let device = Self::create_tun().unwrap();
 
         let tun_name = device.tun_name().unwrap();
 
         run_command(
             format!(
-                "ifconfig {} {:?}/{:?} 11.32.45.1 up",
+                "ifconfig {} {:?}/{:?} 110.32.45.1 up",
                 tun_name, "110.32.45.1", "32"
             )
             .as_str(),
@@ -38,10 +34,10 @@ impl VirtualNic {
         .await
         .unwrap();
 
-        VirtualNic { tun: Arc::new(Mutex::new(device)) }
+        VirtualNic { tun: device }
     }
 
-    pub fn create_tun() -> Result<tun::Device, Box<dyn std::error::Error>> {
+    fn create_tun() -> Result<tun::AsyncDevice, Box<dyn std::error::Error>> {
         let mut config = tun::Configuration::default();
         config.layer(Layer::L3);
 
@@ -52,6 +48,10 @@ impl VirtualNic {
 
         config.up();
 
-        Ok(tun::create(&config)?)
+        Ok(tun::create_as_async(&config)?)
+    }
+
+    pub fn split(self) -> std::io::Result<(DeviceWriter, DeviceReader)> {
+        self.tun.split()
     }
 }
