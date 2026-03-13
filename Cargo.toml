@@ -1,7 +1,8 @@
 [workspace]
-members = ["noeio"]
+members = ["noeio", "noeio-center", "noeio-common", "noeio-derp"]
 
 [workspace.dependencies]
+noeio-common = { path = "noeio-common" }
 axum = "0.8.8"
 tokio = { version = "1.49.0", features = ["full"] }
 boringtun = "0.7"
@@ -13,3 +14,4 @@ tracing-subscriber = "0.3.22"
 stun_codec = "0.4.0"
 rand = "0.10.0"
 bytecodec = "0.5.0"
+bytes = "1.11.1"
