@@ -1,7 +1,8 @@
-use std::collections::HashMap;
 use crate::cli::{Cli, Command};
 use crate::packet::PacketManager;
 use clap::Parser;
+use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader, PingPacketPayload};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -10,11 +11,11 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use noeio_common::packet::{NoeioPacket, NoeioPacketType};
 
 mod cli;
 mod connection;
 mod packet;
+mod router;
 
 #[tokio::main]
 async fn main() {
@@ -67,12 +68,7 @@ fn handle_udp_connection(
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-
-        // temp
-        let mut releation = vec![];
-
-
-        let mut buf = [0; 2048];
+        let mut buf = [0; noeio_common::MAX_PACKET_LEN];
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -82,6 +78,7 @@ fn handle_udp_connection(
                     }
                 }
                 recv_result = udp.recv_from(&mut buf) => {
+
                     let (size, addr) = match recv_result {
                         Ok(v) => v,
                         Err(err) => {
@@ -89,35 +86,50 @@ fn handle_udp_connection(
                             continue;
                         }
                     };
-                    let data = buf[..size].to_vec();
-                    let packet = NoeioPacket::from(data.clone());
-                    if packet.packet_type == NoeioPacketType::Ping {
-                        if releation.len() < 2 {
-                            if !releation.contains(&addr.clone()) {
-                                releation.push(addr);
-                            }
-                        }
+                    if let Err(err) = handle_udp_recv(&buf[..size], addr, &sender).await {
+                        tracing::error!("Error handling UDP recv: {}", err);
                     }
-
-                    if releation.len() == 2 && packet.packet_type == NoeioPacketType::Forward {
-                        let mut forward = releation[0].clone();
-                        if addr == releation[0] {
-                            forward = releation[1].clone();
-                        }
-                        udp.send_to(&buf[..size], forward).await.unwrap();
-                    }
-
-
-                    // if let Err(err) = sender.send(packet) {
-                    //     if *shutdown.borrow() {
-                    //         break;
-                    //     }
-                    //     tracing::error!("Error sending data: {:?}", err);
-                    // }
                 }
             }
         }
     })
+}
+
+async fn handle_udp_recv(
+    data: &[u8],
+    addr: SocketAddr,
+    sender: &Sender<NoeioPacket>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = data.to_vec();
+    let mut packet = NoeioPacket::from(data.clone());
+
+    //
+    if packet.packet_type == NoeioPacketType::Ping {
+        let ipv4_addr = match to_ipv4(addr) {
+            None => return Err(format!("[handle ping] Address {} is not IPv4", addr).into()),
+            Some(ip) => ip,
+        };
+        let port = addr.port();
+
+        let payload = PingPacketPayload {
+            ip: ipv4_addr,
+            port,
+        };
+
+        packet.set_payload(&payload.to_bytes())
+    };
+
+    if let Err(err) = sender.send(packet) {
+        tracing::error!("Error sending data: {:?}", err);
+    }
+    Ok(())
+}
+
+fn to_ipv4(addr: SocketAddr) -> Option<Ipv4Addr> {
+    match addr {
+        SocketAddr::V4(v4) => Some(*v4.ip()),
+        SocketAddr::V6(_) => None,
+    }
 }
 
 #[cfg(unix)]
