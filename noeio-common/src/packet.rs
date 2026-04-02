@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoeioPacketType {
@@ -10,16 +10,16 @@ pub enum NoeioPacketType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
     pub packet_type: NoeioPacketType,
-    pub forward_ip: Ipv4Addr,
-    pub forward_port: u16,
+    pub ip: Ipv4Addr,
+    pub port: u16,
 }
 
 impl Default for PacketHeader {
     fn default() -> Self {
         PacketHeader {
             packet_type: NoeioPacketType::Forward,
-            forward_ip: Ipv4Addr::UNSPECIFIED,
-            forward_port: 0,
+            ip: Ipv4Addr::UNSPECIFIED,
+            port: 0,
         }
     }
 }
@@ -30,8 +30,8 @@ impl PacketHeader {
     pub fn to_bytes(&self) -> [u8; Self::LEN] {
         let mut out = [0u8; Self::LEN];
         out[0] = u8::from(self.packet_type);
-        out[1..5].copy_from_slice(&self.forward_ip.octets());
-        out[5..7].copy_from_slice(&self.forward_port.to_be_bytes());
+        out[1..5].copy_from_slice(&self.ip.octets());
+        out[5..7].copy_from_slice(&self.port.to_be_bytes());
         out
     }
 
@@ -42,8 +42,8 @@ impl PacketHeader {
 
         Some(PacketHeader {
             packet_type: NoeioPacketType::from(bytes[0]),
-            forward_ip: Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4]),
-            forward_port: u16::from_be_bytes([bytes[5], bytes[6]]),
+            ip: Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4]),
+            port: u16::from_be_bytes([bytes[5], bytes[6]]),
         })
     }
 }
@@ -60,7 +60,87 @@ impl From<&PacketHeader> for Vec<u8> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PingPacketPayload {
+    pub ip: Ipv4Addr,
+    pub port: u16,
+}
+
+impl PingPacketPayload {
+    pub const LEN: usize = 8;
+    const TERMINATOR: [u8; 2] = *b"\r\n";
+
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.ip.octets());
+        out[4..6].copy_from_slice(&self.port.to_be_bytes());
+        out[6..8].copy_from_slice(&Self::TERMINATOR);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+
+        if bytes[6..8] != Self::TERMINATOR {
+            return None;
+        }
+
+        Some(Self {
+            ip: Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]),
+            port: u16::from_be_bytes([bytes[4], bytes[5]]),
+        })
+    }
+
+    pub fn to_socket_addr(&self) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(self.ip, self.port))
+    }
+}
+
+impl From<SocketAddrV4> for PingPacketPayload {
+    fn from(value: SocketAddrV4) -> Self {
+        Self {
+            ip: *value.ip(),
+            port: value.port(),
+        }
+    }
+}
+
+impl From<&SocketAddrV4> for PingPacketPayload {
+    fn from(value: &SocketAddrV4) -> Self {
+        Self {
+            ip: *value.ip(),
+            port: value.port(),
+        }
+    }
+}
+
+impl From<PingPacketPayload> for SocketAddr {
+    fn from(value: PingPacketPayload) -> Self {
+        value.to_socket_addr()
+    }
+}
+
+impl From<&PingPacketPayload> for SocketAddr {
+    fn from(value: &PingPacketPayload) -> Self {
+        value.to_socket_addr()
+    }
+}
+
+impl From<PingPacketPayload> for Vec<u8> {
+    fn from(value: PingPacketPayload) -> Self {
+        value.to_bytes().to_vec()
+    }
+}
+
+impl From<&PingPacketPayload> for Vec<u8> {
+    fn from(value: &PingPacketPayload) -> Self {
+        value.to_bytes().to_vec()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct NoeioPacket {
     pub inner: BytesMut,
     pub packet_type: NoeioPacketType,
@@ -71,6 +151,48 @@ impl NoeioPacket {
 
     pub fn parse_header(&self) -> Option<PacketHeader> {
         PacketHeader::from_bytes(self.inner.as_ref())
+    }
+
+    pub fn set_header(&mut self, header: PacketHeader) {
+        let header_bytes = header.to_bytes();
+
+        if self.inner.len() < Self::HEADER_LEN {
+            self.inner.resize(Self::HEADER_LEN, 0);
+        }
+
+        self.inner[..Self::HEADER_LEN].copy_from_slice(&header_bytes);
+        self.packet_type = header.packet_type;
+    }
+
+    pub fn payload(&self) -> Option<&[u8]> {
+        self.inner.get(Self::HEADER_LEN..)
+    }
+
+    pub fn set_payload(&mut self, payload: &[u8]) {
+        self.ensure_header();
+        self.inner.truncate(Self::HEADER_LEN);
+        self.inner.extend_from_slice(payload);
+    }
+
+    pub fn parse_ping_payload(&self) -> Option<PingPacketPayload> {
+        if self.packet_type != NoeioPacketType::Ping {
+            return None;
+        }
+
+        PingPacketPayload::from_bytes(self.payload()?)
+    }
+
+    fn ensure_header(&mut self) {
+        if self.inner.len() >= Self::HEADER_LEN {
+            return;
+        }
+
+        let header = self.parse_header().unwrap_or(PacketHeader {
+            packet_type: self.packet_type,
+            ..PacketHeader::default()
+        });
+        self.inner.resize(Self::HEADER_LEN, 0);
+        self.inner[..Self::HEADER_LEN].copy_from_slice(&header.to_bytes());
     }
 }
 
@@ -133,8 +255,8 @@ mod tests {
     fn packet_header_to_from_bytes_roundtrip() {
         let header = PacketHeader {
             packet_type: NoeioPacketType::Forward,
-            forward_ip: Ipv4Addr::new(10, 0, 0, 8),
-            forward_port: 51820,
+            ip: Ipv4Addr::new(10, 0, 0, 8),
+            port: 51820,
         };
 
         let bytes = header.to_bytes();
@@ -147,8 +269,8 @@ mod tests {
     fn noeio_packet_parse_header_from_inner() {
         let header = PacketHeader {
             packet_type: NoeioPacketType::Ping,
-            forward_ip: Ipv4Addr::new(192, 168, 1, 1),
-            forward_port: 443,
+            ip: Ipv4Addr::new(192, 168, 1, 1),
+            port: 443,
         };
 
         let mut bytes = header.to_bytes().to_vec();
@@ -165,8 +287,8 @@ mod tests {
     fn packet_header_to_vec() {
         let header = PacketHeader {
             packet_type: NoeioPacketType::Forward,
-            forward_ip: Ipv4Addr::new(127, 0, 0, 1),
-            forward_port: 8080,
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port: 8080,
         };
 
         let bytes: Vec<u8> = header.into();
@@ -181,5 +303,107 @@ mod tests {
 
         let out: Vec<u8> = packet.into();
         assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn ping_packet_payload_to_from_bytes_roundtrip() {
+        let payload = PingPacketPayload {
+            ip: Ipv4Addr::new(10, 1, 2, 3),
+            port: 51820,
+        };
+
+        let bytes = payload.to_bytes();
+        assert_eq!(&bytes[6..8], b"\r\n");
+        let parsed = PingPacketPayload::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn ping_packet_payload_requires_crlf_terminator() {
+        let mut bytes = PingPacketPayload {
+            ip: Ipv4Addr::new(10, 1, 2, 3),
+            port: 51820,
+        }
+        .to_bytes();
+        bytes[6] = b'\n';
+        bytes[7] = b'\r';
+
+        assert_eq!(PingPacketPayload::from_bytes(&bytes), None);
+    }
+
+    #[test]
+    fn ping_packet_payload_to_socket_addr() {
+        let payload = PingPacketPayload {
+            ip: Ipv4Addr::new(192, 168, 0, 9),
+            port: 8080,
+        };
+
+        assert_eq!(
+            payload.to_socket_addr(),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 9), 8080))
+        );
+    }
+
+    #[test]
+    fn noeio_packet_parse_ping_payload() {
+        let header = PacketHeader {
+            packet_type: NoeioPacketType::Ping,
+            ip: Ipv4Addr::UNSPECIFIED,
+            port: 0,
+        };
+        let payload = PingPacketPayload {
+            ip: Ipv4Addr::new(172, 16, 0, 10),
+            port: 9000,
+        };
+
+        let mut bytes = header.to_bytes().to_vec();
+        bytes.extend_from_slice(&payload.to_bytes());
+
+        let packet = NoeioPacket::from(bytes);
+
+        assert_eq!(packet.parse_ping_payload(), Some(payload));
+    }
+
+    #[test]
+    fn noeio_packet_set_header_preserves_payload() {
+        let header = PacketHeader {
+            packet_type: NoeioPacketType::Forward,
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            port: 8080,
+        };
+        let mut bytes = header.to_bytes().to_vec();
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+
+        let mut packet = NoeioPacket::from(bytes);
+        let new_header = PacketHeader {
+            packet_type: NoeioPacketType::Ping,
+            ip: Ipv4Addr::new(192, 168, 1, 10),
+            port: 9000,
+        };
+
+        packet.set_header(new_header);
+
+        assert_eq!(packet.parse_header(), Some(new_header));
+        assert_eq!(packet.payload(), Some([1, 2, 3, 4].as_slice()));
+        assert_eq!(packet.packet_type, NoeioPacketType::Ping);
+    }
+
+    #[test]
+    fn noeio_packet_set_payload_preserves_header() {
+        let header = PacketHeader {
+            packet_type: NoeioPacketType::Forward,
+            ip: Ipv4Addr::new(10, 10, 0, 1),
+            port: 51820,
+        };
+        let mut bytes = header.to_bytes().to_vec();
+        bytes.extend_from_slice(&[9, 8, 7]);
+
+        let mut packet = NoeioPacket::from(bytes);
+        packet.set_payload(&[4, 5, 6, 7]);
+
+        assert_eq!(packet.parse_header(), Some(header));
+        assert_eq!(packet.payload(), Some([4, 5, 6, 7].as_slice()));
+        assert_eq!(packet.packet_type, NoeioPacketType::Forward);
     }
 }
