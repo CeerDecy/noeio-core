@@ -27,7 +27,7 @@ impl VirtualNic {
         run_command(
             format!(
                 "route -n add {} -netmask {} -interface {} -hopcount {}",
-                "110.0.0.1", "255.255.255.255", tun_name, "7"
+                "110.32.45.2", "255.255.255.255", tun_name, "7"
             )
             .as_str(),
         )
