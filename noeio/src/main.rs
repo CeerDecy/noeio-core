@@ -3,7 +3,7 @@ use crate::pkg::stun;
 use boringtun::noise::{Tunn, TunnResult};
 use clap::Parser;
 use interface::virtual_nic::VirtualNic;
-use noeio_common::packet::{NoeioPacketType, PacketHeader};
+use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader};
 use pnet::packet::Packet;
 use pnet::packet::icmp::IcmpPacket;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -92,6 +92,7 @@ async fn main() {
             let (tun_writer,mut tun_reader) = nic.split().unwrap();
 
             handle_udp_connection(tun_writer, conn.clone());
+            keepalive(conn.clone());
 
             let mut buf = vec![0u8; 4096];
             loop {
@@ -101,8 +102,8 @@ async fn main() {
 
                 let header = PacketHeader {
                     packet_type: NoeioPacketType::Forward,
-                    forward_ip: Ipv4Addr::new(110, 0, 0, 1),
-                    forward_port: 8000,
+                    ip: Ipv4Addr::new(110, 0, 0, 1),
+                    port: 8000,
                 };
                 let header_bytes = header.to_bytes();
                 let mut payload = Vec::with_capacity(header_bytes.len() + n);
@@ -125,8 +126,21 @@ fn handle_udp_connection(mut writer: DeviceWriter, conn: Arc<UdpSocket>) {
             let mut buf = vec![0u8; 4096];
             match conn.recv_from(&mut buf).await {
                 Ok((n, addr)) => {
-                    tracing::debug!("Received packet, sending to overlay, {:?}", buf);
-                    writer.write(&buf[..n]).await.unwrap();
+                    tracing::info!(
+                        "Received packet from {}, sending to overlay, {:?}",
+                        addr,
+                        &buf[0..n]
+                    );
+
+                    let payload = buf[..n].to_vec();
+                    let packet = NoeioPacket::from(payload);
+
+                    let mut data = vec![];
+                    if let Some(payload) = packet.payload() {
+                        data = payload.to_vec()
+                    }
+
+                    writer.write(&data).await.unwrap();
                 }
                 Err(err) => {
                     tracing::error!(%err, "Error receiving data");
@@ -135,3 +149,24 @@ fn handle_udp_connection(mut writer: DeviceWriter, conn: Arc<UdpSocket>) {
         }
     });
 }
+
+fn keepalive(conn: Arc<UdpSocket>) {
+    tokio::spawn(async move {
+        loop {
+            let header = PacketHeader {
+                packet_type: NoeioPacketType::Ping,
+                ip: Ipv4Addr::new(0, 0, 0, 0),
+                port: 0,
+            };
+            let header_bytes = header.to_bytes();
+            conn.send_to(
+                header_bytes.as_slice(),
+                "129.226.135.14:8080",
+            )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
