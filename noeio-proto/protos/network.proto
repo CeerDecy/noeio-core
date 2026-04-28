@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package network;
+
+message Network {
+  string name = 1;
+}
+
+message ListNetworkRequest {}
+
+message ListNetworkResponse {
+  repeated Network networks = 1;
+}
+
+message CreateNetworkRequest{
+  string name = 1;
+  string ip = 2;
+  string ip_version = 3;
+  string cidr = 4;
+}
+
+message CreateNetworkResponse {
+  string id = 1;
+}
+
+service NetworkService {
+  rpc ListNetworks (ListNetworkRequest)  returns (ListNetworkResponse);
+  rpc CreateNetwork (CreateNetworkRequest) returns (CreateNetworkResponse);
+}

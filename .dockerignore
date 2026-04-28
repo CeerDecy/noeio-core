@@ -1,0 +1,5 @@
+target
+build/out
+.git
+.idea
+.vscode

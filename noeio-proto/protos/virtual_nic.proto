@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package nic;
+
+message CreateVirtualNicRequest {
+  string ip = 1;
+  string ip_version = 2;
+  string network_id = 3;
+}
+
+message CreateVirtualNicResponse {
+  string tun_name = 1;
+}
+
+service VirtualNicService {
+  rpc CreateVirtualNic(CreateVirtualNicRequest) returns (CreateVirtualNicResponse);
+}
