@@ -1,3 +1,5 @@
+pub mod host_info;
 pub mod packet;
 
-pub static MAX_PACKET_LEN: usize = 2048;
+#[cfg(windows)]
+pub mod named_pipe;

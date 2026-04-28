@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 bytes = { workspace = true }
+hostname = { workspace = true }
+smoltcp = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
