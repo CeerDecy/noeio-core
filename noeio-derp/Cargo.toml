@@ -10,3 +10,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true, features = ["derive"] }
 dashmap = { workspace = true }
+moka = { workspace = true }

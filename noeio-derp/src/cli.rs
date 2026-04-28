@@ -10,5 +10,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    Boot,
+    Boot {
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+    },
 }

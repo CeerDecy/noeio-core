@@ -1,22 +1,23 @@
+use noeio_common::packet::NoeioPacket;
+use std::net::SocketAddr;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use noeio_common::packet::NoeioPacket;
 
 pub struct PacketManager {
-    pub sender: Sender<NoeioPacket>,
+    pub sender: Sender<(SocketAddr, NoeioPacket)>,
     pub shutdown: watch::Receiver<bool>,
     pub task: JoinSet<()>,
 }
 
 impl PacketManager {
-    pub fn new(sender: Sender<NoeioPacket>, shutdown: watch::Receiver<bool>) -> Self {
+    pub fn new(sender: Sender<(SocketAddr, NoeioPacket)>, shutdown: watch::Receiver<bool>) -> Self {
         let task: JoinSet<()> = JoinSet::new();
 
         let mut manager = PacketManager {
             sender,
             shutdown,
-            task
+            task,
         };
 
         manager.handle_recv();
@@ -37,7 +38,7 @@ impl PacketManager {
                         }
                     }
                     recv_result = receiver.recv() => {
-                        let payload = match recv_result {
+                        let (addr, payload) = match recv_result {
                             Ok(packet) => packet,
                             Err(err) => {
                                 tracing::error!("failed to receive packet: {}", err);
