@@ -36,16 +36,16 @@ impl StunClientFactory {
         let (sender, receiver) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
 
         let sender_clone = sender.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
-            loop {
-                let Ok((size, _)) = socket.recv_from(&mut buf).await else {
-                    break;
-                };
-                let data = buf[..size].to_vec();
-                sender_clone.send(data).unwrap();
-            }
-        });
+        // tokio::spawn(async move {
+        //     let mut buf = vec![0u8; 2048];
+        //     loop {
+        //         let Ok((size, _)) = socket.recv_from(&mut buf).await else {
+        //             break;
+        //         };
+        //         let data = buf[..size].to_vec();
+        //         sender_clone.send(data).unwrap();
+        //     }
+        // });
 
         StunClientFactory {
             sender,
@@ -54,8 +54,11 @@ impl StunClientFactory {
         }
     }
 
-    pub async fn create(&self) -> Result<StunClient, Box<dyn std::error::Error>> {
-        let stun_server = "stun.chat.bilibili.com:3478";
+    pub async fn create(
+        &self,
+        stun_server: &str,
+    ) -> Result<StunClient, Box<dyn std::error::Error>> {
+        // let stun_server = "stun.chat.bilibili.com:3478";
 
         let addrs: Vec<_> = lookup_host(stun_server).await?.collect();
         let server_addr = addrs
@@ -131,13 +134,14 @@ impl StunClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
     use tokio::time;
-    use super::*;
     #[tokio::test]
     async fn test_stun_client() {
-        let factory = StunClientFactory::new(Arc::new(UdpSocket::bind("0.0.0.0:8080").await.unwrap()));
-        let mut client = factory.create().await.unwrap();
+        let factory =
+            StunClientFactory::new(Arc::new(UdpSocket::bind("0.0.0.0:8080").await.unwrap()));
+        let mut client = factory.create("stun.chat.bilibili.com:3478").await.unwrap();
         let addr = client.get_address().await.unwrap();
         println!("{}", addr);
         // time::sleep(Duration::from_secs(10000)).await;

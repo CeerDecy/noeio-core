@@ -1,40 +1,73 @@
-use std::io::{Read, Write};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::pkg::command::run_command;
-use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer};
+use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use smoltcp::phy::PcapLinkType::Ip;
+use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer, ToAddress};
 
 pub struct VirtualNic {
-    pub tun: tun::AsyncDevice,
+    pub writer: DeviceWriter,
+    pub tun_name: String,
+    pub ip: IpAddr,
 }
 
 impl VirtualNic {
-    pub async fn create() -> VirtualNic {
+    pub async fn create_ipv4_nic(ip: Ipv4Addr) -> (VirtualNic, DeviceReader) {
         let device = Self::create_tun().unwrap();
 
         let tun_name = device.tun_name().unwrap();
 
-        run_command(
-            format!(
-                "ifconfig {} {:?}/{:?} 110.32.45.1 up",
-                tun_name, "110.32.45.1", "32"
-            )
-            .as_str(),
-        )
-        .await
-        .unwrap();
+        // set host ip
+        run_command(format!("ifconfig {} {:?}/{} {:?} up", tun_name, ip, "32", ip).as_str())
+            .await
+            .unwrap();
 
-        run_command(
-            format!(
-                "route -n add {} -netmask {} -interface {} -hopcount {}",
-                "110.32.45.2", "255.255.255.255", tun_name, "7"
-            )
-            .as_str(),
-        )
-        .await
-        .unwrap();
+        let (tun_writer, tun_reader) = device.split().unwrap();
 
-        VirtualNic { tun: device }
+        (VirtualNic {
+            writer: tun_writer,
+            tun_name,
+            ip: IpAddr::V4(ip),
+        }, tun_reader)
+    }
+
+    pub async fn add_router_rule(
+        &self,
+        target: IpAddr,
+        netmask: &str,
+        hopcount: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        #[cfg(target_os = "macos")]
+        let cmd = format!(
+            "route -n add {} -netmask {} -interface {} -hopcount {}",
+            target, netmask, self.tun_name, hopcount
+        );
+
+        #[cfg(target_os = "linux")]
+        let cmd = {
+            let prefix = netmask_to_prefix(netmask)?;
+            format!(
+                "ip route add {}/{} dev {} metric {}",
+                target, prefix, self.tun_name, hopcount
+            )
+        };
+
+        #[cfg(target_os = "windows")]
+        let cmd = {
+            let prefix = netmask_to_prefix(netmask)?;
+            format!(
+                "netsh interface ipv4 add route prefix={}/{} interface=\"{}\" metric={}",
+                target, prefix, self.tun_name, hopcount
+            )
+        };
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let cmd: String = {
+            let _ = (target, netmask, hopcount);
+            return Err("add_router_rule: unsupported platform".into());
+        };
+
+        run_command(&cmd).await
     }
 
     fn create_tun() -> Result<tun::AsyncDevice, Box<dyn std::error::Error>> {
@@ -50,8 +83,18 @@ impl VirtualNic {
 
         Ok(tun::create_as_async(&config)?)
     }
+}
 
-    pub fn split(self) -> std::io::Result<(DeviceWriter, DeviceReader)> {
-        self.tun.split()
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn netmask_to_prefix(netmask: &str) -> Result<u8, Box<dyn Error>> {
+    let addr: Ipv4Addr = netmask
+        .parse()
+        .map_err(|_| format!("invalid netmask: {}", netmask))?;
+    let bits = u32::from(addr);
+    let ones = bits.leading_ones();
+    let expected = if ones == 32 { u32::MAX } else { !0u32 << (32 - ones) };
+    if bits != expected {
+        return Err(format!("non-contiguous netmask: {}", netmask).into());
     }
+    Ok(ones as u8)
 }

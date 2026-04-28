@@ -1,8 +1,12 @@
-use crate::cli::{Cli, Command};
-use crate::pkg::stun;
 use boringtun::noise::{Tunn, TunnResult};
 use clap::Parser;
-use interface::virtual_nic::VirtualNic;
+use noeio::cli::{Cli, Command, CreateResource, ListResource};
+use noeio::config::Config;
+use noeio::daemon::NoeioDaemon;
+use noeio::interface::virtual_nic::VirtualNic;
+use noeio::pkg::stun;
+use noeio::rpc::client::CliRpcClient;
+use noeio::rpc::service;
 use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader};
 use pnet::packet::Packet;
 use pnet::packet::icmp::IcmpPacket;
@@ -12,18 +16,10 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tun::DeviceWriter;
 use x25519_dalek::{PublicKey, StaticSecret};
-
-mod cli;
-mod common;
-mod errors;
-mod interface;
-mod pkg;
-mod tunnel;
 
 #[tokio::main]
 async fn main() {
@@ -37,59 +33,61 @@ async fn main() {
         .try_init();
 
     match cli.command {
-        Command::Boot => {
-            let conn = UdpSocket::bind("0.0.0.0:8000").await.unwrap();
+        Command::Boot { config, port } => {
+            let cfg = Config::load(config);
 
-            let mut local_private = StaticSecret::random();
-            let local_public = PublicKey::from(&local_private);
+            let conn = UdpSocket::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+            let state = NoeioDaemon::new(conn, cfg);
 
-            let mut tunn = Tunn::new(local_private, local_public, None, None, 1, None);
-
-            let nic = VirtualNic::create().await;
-            let (tun_writer, mut tun_reader) = nic.split().unwrap();
-
-            let mut buf = vec![0u8; 4096];
-            loop {
-                let n = tun_reader.read(&mut buf).await.unwrap();
-
-                let ipv4 = Ipv4Packet::new(&buf[4..n]).unwrap();
-                println!("src {:?}", ipv4.get_source());
-                println!("dst {:?}", ipv4.get_destination());
-
-                if let Some(icmp) = IcmpPacket::new(ipv4.payload()) {
-                    println!("ICMP type: {:?}", icmp.get_icmp_type());
-                }
-
-                let mut wg_payload = vec![0u8; 8192];
-                let result = tunn.encapsulate(&mut buf, &mut wg_payload);
-
-                match result {
-                    TunnResult::Done => {}
-                    TunnResult::Err(err) => {
-                        eprintln!("Error: {:?}", err);
-                    }
-                    TunnResult::WriteToNetwork(_) => {}
-                    TunnResult::WriteToTunnelV4(_, _) => {}
-                    TunnResult::WriteToTunnelV6(_, _) => {}
-                }
-            }
+            service::run(state).await.expect("TODO: panic message");
         }
         Command::Stun => {
             let factory = stun::StunClientFactory::new(Arc::new(
                 UdpSocket::bind("0.0.0.0:8080").await.unwrap(),
             ));
-            let mut client = factory.create().await.unwrap();
+            let mut client = factory.create("").await.unwrap();
             if let Ok(addr) = client.get_address().await {
                 println!("{}", addr);
+            }
+        }
+        Command::List { resource } => {
+            let mut client = CliRpcClient::new()
+                .await
+                .expect("failed to connect to daemon");
+            match resource {
+                ListResource::Network => client.list_networks().await.unwrap(),
+                ListResource::Vnic => client.list_vnics().await.unwrap(),
+            }
+        }
+        Command::Create { resource } => {
+            let mut client = CliRpcClient::new()
+                .await
+                .expect("failed to connect to daemon");
+            match resource {
+                CreateResource::Network {
+                    name,
+                    ip,
+                    ip_version,
+                    cidr,
+                } => client
+                    .create_network(name, ip, ip_version, cidr)
+                    .await
+                    .unwrap(),
+                CreateResource::Vnic {
+                    ip,
+                    ip_version,
+                    network,
+                } => client.create_vnic(ip, ip_version, network).await.unwrap(),
             }
         }
         Command::OverlayTest => {
             let conn = UdpSocket::bind("0.0.0.0:8000").await.unwrap();
             let conn = Arc::new(conn);
 
-            let nic = VirtualNic::create().await;
+            let (nic, mut tun_reader) =
+                VirtualNic::create_ipv4_nic(Ipv4Addr::new(127, 0, 0, 1)).await;
 
-            let (tun_writer,mut tun_reader) = nic.split().unwrap();
+            let tun_writer = nic.writer;
 
             handle_udp_connection(tun_writer, conn.clone());
             keepalive(conn.clone());
@@ -102,7 +100,7 @@ async fn main() {
 
                 let header = PacketHeader {
                     packet_type: NoeioPacketType::Forward,
-                    ip: Ipv4Addr::new(110, 0, 0, 1),
+                    peer_id: 0,
                     port: 8000,
                 };
                 let header_bytes = header.to_bytes();
@@ -133,7 +131,13 @@ fn handle_udp_connection(mut writer: DeviceWriter, conn: Arc<UdpSocket>) {
                     );
 
                     let payload = buf[..n].to_vec();
-                    let packet = NoeioPacket::from(payload);
+                    let packet = match NoeioPacket::try_from(payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("invalid packet from {}: {}", addr, e);
+                            continue;
+                        }
+                    };
 
                     let mut data = vec![];
                     if let Some(payload) = packet.payload() {
@@ -155,18 +159,14 @@ fn keepalive(conn: Arc<UdpSocket>) {
         loop {
             let header = PacketHeader {
                 packet_type: NoeioPacketType::Ping,
-                ip: Ipv4Addr::new(0, 0, 0, 0),
+                peer_id: 0,
                 port: 0,
             };
             let header_bytes = header.to_bytes();
-            conn.send_to(
-                header_bytes.as_slice(),
-                "129.226.135.14:8080",
-            )
+            conn.send_to(header_bytes.as_slice(), "129.226.135.14:8080")
                 .await
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
 }
-
