@@ -74,6 +74,11 @@ impl VirtualNic {
         let mut config = tun::Configuration::default();
         config.layer(Layer::L3);
 
+        // macOS kernel requires utun interface names to be `utunN`, so a
+        // custom name can only be set on other platforms.
+        #[cfg(not(target_os = "macos"))]
+        config.tun_name("noeio0");
+
         #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
         config.platform_config(|config| {
             config.packet_information(false);
