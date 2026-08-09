@@ -8,4 +8,4 @@ build:
 ifndef MODEL
 	$(error MODEL is required, e.g. make build MODEL=noeio-derp)
 endif
-	docker buildx build --platform $(PLATFORM) -f build/$(MODEL)/Dockerfile -t $(REGISTRY)/noeio/$(MODEL):$(TAG) --push .
+	docker buildx build --platform $(PLATFORM) -f build/$(MODEL)/Dockerfile -t $(REGISTRY)/$(MODEL):$(TAG) --push .
