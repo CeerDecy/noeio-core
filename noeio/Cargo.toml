@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 noeio-common = { workspace = true }
 noeio-proto = { workspace = true }
+uuid = { workspace = true }
 tun = { workspace = true, features = ["async"] }
 tokio = { workspace = true, features = ["full"] }
 clap = { workspace = true, features = ["derive"] }
@@ -25,4 +26,5 @@ toml = { workspace = true }
 dashmap = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
+async-trait = { workspace = true }
 

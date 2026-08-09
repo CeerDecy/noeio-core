@@ -32,4 +32,5 @@ pnet = "0.35.0"
 hostname = "0.4.2"
 moka = { version = "0.12", features = ["sync"] }
 uuid = "1"
+async-trait = "0.1"
 

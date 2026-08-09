@@ -103,10 +103,7 @@ async fn main() {
                     peer_id: 0,
                     port: 8000,
                 };
-                let header_bytes = header.to_bytes();
-                let mut payload = Vec::with_capacity(header_bytes.len() + n);
-                payload.extend_from_slice(&header_bytes);
-                payload.extend_from_slice(&buf[..n]);
+                let payload: Vec<u8> = NoeioPacket::new(header, &buf[..n]).into();
 
                 tracing::debug!("payload: {:?}", payload);
 
@@ -162,8 +159,8 @@ fn keepalive(conn: Arc<UdpSocket>) {
                 peer_id: 0,
                 port: 0,
             };
-            let header_bytes = header.to_bytes();
-            conn.send_to(header_bytes.as_slice(), "129.226.135.14:8080")
+            let bytes: Vec<u8> = NoeioPacket::new(header, &[]).into();
+            conn.send_to(bytes.as_slice(), "129.226.135.14:8080")
                 .await
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;

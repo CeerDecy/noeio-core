@@ -132,6 +132,12 @@ impl ConnectionManager {
                         }
                     }
                     NoeioPacketType::SyncRoute => {}
+                    NoeioPacketType::Seq
+                    | NoeioPacketType::Ack
+                    | NoeioPacketType::KeepAlive => {
+                        // Hole-punch and keepalive signalling is peer-to-peer;
+                        // the relay does not act on it.
+                    }
                     NoeioPacketType::Report => {
                         let header = match packet.parse_header() {
                             None => {
@@ -204,7 +210,10 @@ impl ConnectionManager {
 
                             let udp = udp.clone();
                             let to_addr = addr.clone();
-                            let info = peer_info.clone();
+                            let info = peer_info
+                                .clone()
+                                .with_nat_type(info.nat_type)
+                                .with_nat_addr(Some(info.nat_addr));
                             let payload: Vec<u8> = (&info).into();
                             let target_peer = target_id.clone();
                             tokio::spawn(async move {
@@ -212,10 +221,7 @@ impl ConnectionManager {
                                 header.packet_type = NoeioPacketType::SyncRoute;
                                 header.peer_id = target_peer;
 
-                                let header_bytes = header.to_bytes();
-                                let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
-                                packet.extend_from_slice(&header_bytes);
-                                packet.extend_from_slice(&payload);
+                                let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
 
                                 if let Err(err) = udp.send_to(packet.as_slice(), to_addr).await {
                                     tracing::error!("failed to send sync route: {}", err);

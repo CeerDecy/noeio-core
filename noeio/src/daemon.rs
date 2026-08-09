@@ -1,23 +1,24 @@
 pub mod derper;
 pub mod nic;
+pub mod peer;
+pub mod router;
 pub mod stun;
 
+use std::io::ErrorKind;
 use crate::common;
 use crate::config::Config;
 use crate::daemon::derper::DerperManager;
 use crate::daemon::nic::NicManager;
+use crate::daemon::peer::Peer;
+use crate::daemon::router::Router;
 use crate::daemon::stun::StunManager;
 use crate::interface::virtual_nic::VirtualNic;
 use bytecodec::{DecodeExt, EncodeExt, Error as BytecodecError};
-use dashmap::DashMap;
-use dashmap::mapref::one::Ref;
 use noeio_common::host_info;
-use noeio_common::host_info::{HostInfo, PeerId, PeerInfo};
+use noeio_common::host_info::{HostInfo, NatType, PeerId, PeerInfo};
 use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader};
 use smoltcp::wire::Ipv4Packet;
-use std::convert::Infallible;
-use std::io::Error;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use stun_codec::rfc5389::Attribute;
 use stun_codec::rfc5389::methods::BINDING;
@@ -31,15 +32,16 @@ use tokio::task::JoinSet;
 use tun::DeviceReader;
 
 const MAX_BUFFER_SIZE: usize = 2048;
+const STUN_PROBE_INTERVAL_MINS: u64 = 10;
 
 pub struct NoeioDaemon {
     pub nics: NicManager,
-    pub udp: UdpSocket,
+    pub udp: Arc<UdpSocket>,
     pub config: Config,
     pub derper: DerperManager,
     pub stun: StunManager,
     pub host_info: Mutex<Option<HostInfo>>,
-    pub router: DashMap<IpAddr, PeerId>,
+    pub router: Router,
     pub task: JoinSet<()>,
 }
 
@@ -49,12 +51,12 @@ impl NoeioDaemon {
         let stun = StunManager::from(cfg.stun.clone());
         let daemon = Arc::new(Self {
             nics: NicManager::new(),
-            udp,
+            udp: Arc::new(udp),
             derper,
             stun,
             config: cfg,
             host_info: Mutex::new(None),
-            router: DashMap::new(),
+            router: Router::new(),
             task: JoinSet::new(),
         });
 
@@ -100,6 +102,32 @@ impl NoeioDaemon {
         process_outbound(state, reader);
         Ok(())
     }
+
+    pub async fn common_send(&self, peer: &Peer, payload: &Vec<u8>) -> std::io::Result<usize> {
+        if let Some(nat_addr) = peer.address() {
+            tracing::info!(
+                peer_id = peer.info.peer_id,
+                %nat_addr,
+                "common_send: direct path",
+            );
+            return self.udp.send_to(payload, nat_addr).await;
+        }
+
+        let derper = match self.derper.current().await {
+            None => {
+                tracing::error!("DERPER: No server selected");
+                return Err(std::io::Error::new(ErrorKind::NotFound, "No server selected"));
+            }
+            Some(derper) => derper,
+        };
+
+        tracing::info!(
+            peer_id = peer.info.peer_id,
+            %derper,
+            "common_send: relay path",
+        );
+        self.udp.send_to(&payload, derper).await
+    }
 }
 
 pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
@@ -122,12 +150,12 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
                     if let Some(ipv4) = Ipv4Packet::new_checked(ip_bytes).ok() {
                         let dst_ip = IpAddr::from(ipv4.dst_addr());
 
-                        let peer_id = match state.router.get(&dst_ip) {
+                        let peer = match state.router.get(&dst_ip) {
                             None => {
                                 tracing::error!(
-                                    "no router found for {}, {:?}",
+                                    "no router found for {}, known routes: {:?}",
                                     dst_ip,
-                                    state.router
+                                    state.router.ips()
                                 );
                                 continue;
                             }
@@ -136,24 +164,13 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
 
                         let header = PacketHeader {
                             packet_type: NoeioPacketType::Forward,
-                            peer_id,
+                            peer_id: peer.info.peer_id,
                             port: 0,
                         };
 
-                        let header_bytes = header.to_bytes();
-                        let mut payload = Vec::with_capacity(header_bytes.len() + ip_bytes.len());
-                        payload.extend_from_slice(&header_bytes);
-                        payload.extend_from_slice(ip_bytes);
+                        let payload: Vec<u8> = NoeioPacket::new(header, ip_bytes).into();
 
-                        let derper = match state.derper.current().await {
-                            None => {
-                                tracing::error!("DERPER: No server selected");
-                                continue;
-                            }
-                            Some(derper) => derper,
-                        };
-
-                        if let Err(err) = state.udp.send_to(&payload, derper).await {
+                        if let Err(err) = state.common_send(&peer, &payload).await {
                             tracing::error!("Failed to send packet: {}", err);
                         }
                     }
@@ -198,10 +215,7 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
                 header.packet_type = NoeioPacketType::Report;
                 header.peer_id = peer_id;
 
-                let header_bytes = header.to_bytes();
-                let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
-                packet.extend_from_slice(&header_bytes);
-                packet.extend_from_slice(&payload);
+                let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
 
                 if let Err(err) = daemon.udp.send_to(&packet, addr).await {
                     tracing::error!("failed to send host info: {}", err);
@@ -214,44 +228,46 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
     });
 }
 
+async fn send_stun_probe(daemon: &Arc<NoeioDaemon>) -> io::Result<()> {
+    let Some(stun_server) = daemon.stun.pick_server() else {
+        return Ok(());
+    };
+
+    let addrs: Vec<_> = lookup_host(stun_server).await?.collect();
+
+    let server_addr = addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| addrs.first().copied())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "failed to resolve STUN server"))?;
+
+    let tid = common::stun::generate_tid();
+    let message: stun_codec::Message<ChangeRequest> =
+        stun_codec::Message::new(stun_codec::MessageClass::Request, BINDING, tid);
+
+    let mut encoder = MessageEncoder::new();
+    let bytes = encoder
+        .encode_into_bytes(message)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+
+    daemon.udp.send_to(&bytes, server_addr).await?;
+
+    Ok(())
+}
+
 pub fn stun_probe(daemon: Arc<NoeioDaemon>) {
     tokio::spawn(async move {
+        if let Err(err) = send_stun_probe(&daemon).await {
+            tracing::error!("stun probe failed: {}", err);
+        }
+
         loop {
-            if let Some(stun_server) = daemon.stun.pick_server() {
-                let addrs: Vec<_> = match lookup_host(stun_server).await {
-                    Ok(addr) => addr.collect(),
-                    Err(err) => {
-                        tracing::error!("stun server lookup failed: {}", err);
-                        return;
-                    }
-                };
-
-                let server_addr = match addrs
-                    .iter()
-                    .copied()
-                    .find(|addr| addr.is_ipv4())
-                    .or_else(|| addrs.first().copied())
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "failed to resolve STUN server")
-                    }) {
-                    Ok(addr) => addr,
-                    Err(err) => {
-                        tracing::error!("stun server lookup failed: {}", err);
-                        return;
-                    }
-                };
-
-                let tid = common::stun::generate_tid();
-                let message: stun_codec::Message<ChangeRequest> =
-                    stun_codec::Message::new(stun_codec::MessageClass::Request, BINDING, tid);
-
-                let mut encoder = MessageEncoder::new();
-                let bytes = encoder.encode_into_bytes(message).unwrap();
-
-                daemon.udp.send_to(&bytes, server_addr).await.unwrap();
+            if let Err(err) = send_stun_probe(&daemon).await {
+                tracing::error!("stun probe failed: {}", err);
             }
 
-            tokio::time::sleep(std::time::Duration::from_mins(10)).await;
+            tokio::time::sleep(std::time::Duration::from_mins(STUN_PROBE_INTERVAL_MINS)).await;
         }
     });
 }
@@ -306,9 +322,29 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                 if let Some(payload) = packet.payload() {
                                     match PeerInfo::try_from(payload) {
                                         Ok(peer) => {
-                                            state.router.insert(peer.noeio_ip, peer.peer_id);
-                                            if let Err(err) =
-                                                state.nics.route(Some(header.peer_id), peer.noeio_ip).await
+                                            // `header.peer_id` is our own id in
+                                            // this peer's network (SyncRoute is
+                                            // addressed to us); the session stamps
+                                            // it into the signalling it sends.
+                                            match state.router.get_mut(&peer.noeio_ip) {
+                                                Some(mut existing) => {
+                                                    existing.update_info(
+                                                        peer.clone(),
+                                                        header.peer_id,
+                                                    );
+                                                }
+                                                None => {
+                                                    state.router.insert(Peer::new(
+                                                        peer.clone(),
+                                                        state.udp.clone(),
+                                                        header.peer_id,
+                                                    ));
+                                                }
+                                            }
+                                            if let Err(err) = state
+                                                .nics
+                                                .route(Some(header.peer_id), peer.noeio_ip)
+                                                .await
                                             {
                                                 tracing::error!(
                                                     "Failed to route peer {} via local nic {}: {}",
@@ -328,6 +364,16 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                 }
                             }
                             NoeioPacketType::Report => {}
+                            // Seq/Ack/KeepAlive are a session's signalling traffic.
+                            // The peer's `UdpTunnelSession::dispatch` task owns the
+                            // handling (nonce-matched handshake, Ack reply, liveness
+                            // stamp); here we only resolve the peer by `peer_id` and
+                            // hand the raw datagram to its session's inbound channel.
+                            NoeioPacketType::Seq
+                            | NoeioPacketType::Ack
+                            | NoeioPacketType::KeepAlive => {
+                                dispatch_signalling(&state, &header, &buf[..n], addr).await;
+                            }
                         }
                         continue;
                     }
@@ -346,6 +392,18 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                             let new_info = HostInfo::new(addr);
                             match info.as_mut() {
                                 Some(existing) => {
+                                    let nat_type = if existing.nat_addr == new_info.nat_addr {
+                                        NatType::Other
+                                    } else {
+                                        NatType::Symmetric
+                                    };
+                                    tracing::info!(
+                                        %nat_type,
+                                        prev = ?existing.nat_addr,
+                                        curr = ?new_info.nat_addr,
+                                        "determined NAT type",
+                                    );
+                                    existing.nat_type = nat_type;
                                     existing.nat_addr = new_info.nat_addr;
                                     existing.hostname = new_info.hostname;
                                 }
@@ -366,6 +424,44 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
             }
         }
     });
+}
+
+/// Route a session's signalling datagram (Seq/Ack/KeepAlive) to the peer it
+/// names.
+///
+/// Resolves the peer by `header.peer_id` and hands the raw datagram to its
+/// `UdpTunnelSession` inbound channel; the session's `dispatch` task owns the
+/// actual handling (nonce-matched handshake, Ack reply, liveness stamp).
+///
+/// The peer handle is cloned out and the `Router`'s DashMap guard dropped before
+/// awaiting: `inbound` awaits on the session channel, and holding a shard
+/// read-lock across that await could deadlock a concurrent `insert`/`get_mut` on
+/// the same shard.
+async fn dispatch_signalling(
+    state: &Arc<NoeioDaemon>,
+    header: &PacketHeader,
+    datagram: &[u8],
+    src: SocketAddr,
+) {
+    let Some(peer) = state
+        .router
+        .get_by_peer_id(&header.peer_id)
+        .map(|peer| peer.clone())
+    else {
+        tracing::warn!(
+            peer_id = header.peer_id,
+            "received signalling packet for unknown peer",
+        );
+        return;
+    };
+
+    if !peer.inbound(datagram.to_vec(), src).await {
+        tracing::debug!(
+            peer_id = header.peer_id,
+            ?header.packet_type,
+            "dropping signalling packet: peer has no live session",
+        );
+    }
 }
 
 fn parse_mapped_addr(response: Message<Attribute>) -> Option<SocketAddr> {
@@ -391,12 +487,12 @@ mod tests {
         let udp = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         NoeioDaemon {
             nics: NicManager::new(),
-            udp,
+            udp: Arc::new(udp),
             config: Config::default(),
             derper: DerperManager::from(crate::config::Derper::default()),
             stun: StunManager::from(crate::config::Stun::default()),
             host_info: Mutex::new(host_info),
-            router: DashMap::new(),
+            router: Router::new(),
             task: JoinSet::new(),
         }
     }
