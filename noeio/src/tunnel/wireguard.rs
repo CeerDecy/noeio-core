@@ -1,4 +1,4 @@
-use noeio_common::host_info::NetworkInfo;
+use noeio_common::host_info::{NetworkId, NetworkInfo, PeerId};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use uuid::Uuid;
@@ -41,6 +41,24 @@ impl WireGuardConfig {
     }
 }
 
+/// Derive the pairwise WireGuard keys for the tunnel between us
+/// (`local_peer_id`) and `peer_id` within `network_id`.
+///
+/// Each host's identity key pair is derived deterministically from its *own*
+/// peer id, so both ends agree without a key exchange: our secret comes from
+/// our id, and the peer's public key is recomputed from the peer's id with
+/// the same formula.
+pub fn derive_tunnel_keys(
+    local_peer_id: PeerId,
+    peer_id: PeerId,
+    network_id: NetworkId,
+) -> (StaticSecret, PublicKey) {
+    let network = NetworkInfo { network_id };
+    let ours = WireGuardConfig::new_from_network_peer(local_peer_id.to_string(), &network);
+    let theirs = WireGuardConfig::new_from_network_peer(peer_id.to_string(), &network);
+    (ours.my_secret_key, theirs.my_public_key)
+}
+
 pub fn generate_digest(strs: &[&str], digest: &mut [u8]) {
     let mut hasher = DefaultHasher::new();
     for s in strs {
@@ -59,6 +77,29 @@ pub fn generate_digest(strs: &[&str], digest: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_tunnel_keys_interoperate() {
+        // A's view of the pair (us=1, them=2) and B's view (us=2, them=1)
+        // must agree on both public keys, or the WG handshake can't complete.
+        let network: NetworkId = [7u8; 16];
+        let (a_secret, b_public_seen_by_a) = derive_tunnel_keys(1, 2, network);
+        let (b_secret, a_public_seen_by_b) = derive_tunnel_keys(2, 1, network);
+        assert_eq!(
+            PublicKey::from(&a_secret).as_bytes(),
+            a_public_seen_by_b.as_bytes()
+        );
+        assert_eq!(
+            PublicKey::from(&b_secret).as_bytes(),
+            b_public_seen_by_a.as_bytes()
+        );
+        // Different networks must derive different identities.
+        let (other_secret, _) = derive_tunnel_keys(1, 2, [8u8; 16]);
+        assert_ne!(
+            PublicKey::from(&a_secret).as_bytes(),
+            PublicKey::from(&other_secret).as_bytes()
+        );
+    }
 
     #[test]
     fn deterministic_for_same_input() {

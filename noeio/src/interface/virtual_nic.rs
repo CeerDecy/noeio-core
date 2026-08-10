@@ -5,6 +5,16 @@ use std::sync::Arc;
 use smoltcp::phy::PcapLinkType::Ip;
 use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer, ToAddress};
 
+/// MTU of the virtual nic, sized so a full inner packet never fragments the
+/// outer datagram on a 1500-byte physical path, even over IPv6:
+///
+/// `1500 - 40 (outer IPv6) - 8 (UDP) - 9 (noeio header) - 32 (WG data
+/// overhead) = 1411`
+///
+/// (IPv4 outer leaves 20 bytes of slack; WireGuard's conventional 1420 minus
+/// our 9-byte envelope gives the same number.)
+pub const NIC_MTU: u16 = 1411;
+
 pub struct VirtualNic {
     pub writer: DeviceWriter,
     pub tun_name: String,
@@ -73,6 +83,7 @@ impl VirtualNic {
     fn create_tun() -> Result<tun::AsyncDevice, Box<dyn std::error::Error>> {
         let mut config = tun::Configuration::default();
         config.layer(Layer::L3);
+        config.mtu(NIC_MTU);
 
         // macOS kernel requires utun interface names to be `utunN`, so a
         // custom name can only be set on other platforms.

@@ -1,4 +1,4 @@
 pub mod session;
 mod tun;
-mod wireguard;
+pub mod wireguard;
 mod mac;

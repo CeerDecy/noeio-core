@@ -1,4 +1,7 @@
-use crate::tunnel::session::{Datagram, SessionState, TunnelSession, UdpTunnelSession};
+use crate::tunnel::session::{
+    Datagram, SessionState, TunnelSession, UdpTunnelSession, WireGuardTunnelSession,
+};
+use crate::tunnel::wireguard::derive_tunnel_keys;
 use noeio_common::host_info::{NatType, PeerId, PeerInfo};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,6 +33,19 @@ pub struct Peer {
     /// signalling datagrams onto this sender, and the session's `dispatch` task
     /// drains them. `Some` whenever `session` is set.
     pub inbound_tx: Option<mpsc::Sender<Datagram>>,
+    /// Data-plane codec for traffic with this peer: encrypts outbound IP
+    /// packets and decrypts inbound `Delivery` payloads. Sans-IO — the daemon
+    /// owns the socket and the nic writer and executes what the codec's
+    /// [`TunnOutput`](crate::tunnel::session::TunnOutput) instructs.
+    pub codec: Arc<dyn TunnelSession>,
+}
+
+/// Build the WireGuard codec for `info`, keyed by the deterministic pairwise
+/// derivation. The peer's id doubles as boringtun's session index (it only
+/// disambiguates our local session ids; boringtun keeps its low 24 bits).
+fn build_codec(info: &PeerInfo, local_peer_id: PeerId) -> Arc<dyn TunnelSession> {
+    let (secret, peer_public) = derive_tunnel_keys(local_peer_id, info.peer_id, info.network_id);
+    Arc::new(WireGuardTunnelSession::new(secret, peer_public, info.peer_id))
 }
 
 impl Peer {
@@ -44,12 +60,14 @@ impl Peer {
     /// packets carry the sender's id, unlike Forward which carries the
     /// receiver's.
     pub fn new(info: PeerInfo, socket: Arc<UdpSocket>, local_peer_id: PeerId) -> Self {
+        let codec = build_codec(&info, local_peer_id);
         let mut peer = Self {
             info,
             socket,
             local_peer_id,
             session: None,
             inbound_tx: None,
+            codec,
         };
         peer.try_create_tunnel(false);
         peer
@@ -152,10 +170,18 @@ impl Peer {
     pub fn update_info(&mut self, info: PeerInfo, local_peer_id: PeerId) {
         let identity_changed =
             self.info.network_id != info.network_id || self.info.nat_type != info.nat_type;
+        // The codec's keys are derived from (network, peer id, our id); if any
+        // of them changed, the old tunnel can no longer decrypt this peer.
+        let keys_changed = self.info.network_id != info.network_id
+            || self.info.peer_id != info.peer_id
+            || self.local_peer_id != local_peer_id;
         self.info = info;
         // Refresh our own id too: a re-addressed SyncRoute may carry a new one,
         // and a rebuilt session must stamp the current value.
         self.local_peer_id = local_peer_id;
+        if keys_changed {
+            self.codec = build_codec(&self.info, self.local_peer_id);
+        }
         if identity_changed {
             self.try_create_tunnel(true);
         }

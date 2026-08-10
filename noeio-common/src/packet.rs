@@ -17,6 +17,7 @@ pub enum NoeioPacketType {
     Seq,            // UDP hole punch request (initiator)
     Ack,            // UDP hole punch response (acknowledgement)
     KeepAlive,      // periodic packet to keep the NAT mapping open
+    Delivery,       // data packet from the peer named in the header; process locally, never forward
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +261,7 @@ impl TryFrom<u8> for NoeioPacketType {
             4 => Ok(NoeioPacketType::Seq),
             5 => Ok(NoeioPacketType::Ack),
             6 => Ok(NoeioPacketType::KeepAlive),
+            7 => Ok(NoeioPacketType::Delivery),
             _ => Err(value),
         }
     }
@@ -275,6 +277,7 @@ impl From<NoeioPacketType> for u8 {
             NoeioPacketType::Seq => 4,
             NoeioPacketType::Ack => 5,
             NoeioPacketType::KeepAlive => 6,
+            NoeioPacketType::Delivery => 7,
         }
     }
 }
@@ -298,6 +301,51 @@ impl TryFrom<&[u8]> for NoeioPacket {
             inner: BytesMut::from(value),
             packet_type: header.packet_type,
         })
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn every_packet_type_roundtrips_through_wire_encoding() {
+        for packet_type in [
+            NoeioPacketType::Ping,
+            NoeioPacketType::Forward,
+            NoeioPacketType::SyncRoute,
+            NoeioPacketType::Report,
+            NoeioPacketType::Seq,
+            NoeioPacketType::Ack,
+            NoeioPacketType::KeepAlive,
+            NoeioPacketType::Delivery,
+        ] {
+            assert_eq!(NoeioPacketType::try_from(u8::from(packet_type)), Ok(packet_type));
+        }
+    }
+
+    #[test]
+    fn set_header_rewrites_type_and_peer_id_but_keeps_payload() {
+        // The derper relies on this to turn a Forward into a Delivery stamped
+        // with the sender's id without touching the (encrypted) payload.
+        let forward = PacketHeader {
+            packet_type: NoeioPacketType::Forward,
+            peer_id: 42, // destination
+            port: 0,
+        };
+        let mut packet = NoeioPacket::new(forward, b"ciphertext");
+
+        packet.set_header(PacketHeader {
+            packet_type: NoeioPacketType::Delivery,
+            peer_id: 7, // sender
+            port: 0,
+        });
+
+        let header = packet.parse_header().unwrap();
+        assert_eq!(header.packet_type, NoeioPacketType::Delivery);
+        assert_eq!(header.peer_id, 7);
+        assert_eq!(packet.packet_type, NoeioPacketType::Delivery);
+        assert_eq!(packet.payload(), Some(&b"ciphertext"[..]));
     }
 }
 

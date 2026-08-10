@@ -13,6 +13,7 @@ use crate::daemon::peer::Peer;
 use crate::daemon::router::Router;
 use crate::daemon::stun::StunManager;
 use crate::interface::virtual_nic::VirtualNic;
+use crate::tunnel::session::TunnOutput;
 use bytecodec::{DecodeExt, EncodeExt, Error as BytecodecError};
 use noeio_common::host_info;
 use noeio_common::host_info::{HostInfo, NatType, PeerId, PeerInfo};
@@ -33,7 +34,12 @@ use tokio::task::JoinSet;
 use tun::DeviceReader;
 
 const MAX_BUFFER_SIZE: usize = 2048;
+/// Headroom for the WireGuard codec: data packets grow by 32 bytes over the
+/// plaintext, and protocol packets (handshake init = 148 bytes) must also fit.
+const WG_BUFFER_SIZE: usize = MAX_BUFFER_SIZE + 160;
 const STUN_PROBE_INTERVAL_MINS: u64 = 10;
+/// WireGuard expects its timer state machine to be driven roughly every 250ms.
+const WG_TIMER_TICK_MILLIS: u64 = 250;
 
 pub struct NoeioDaemon {
     pub nics: NicManager,
@@ -66,6 +72,8 @@ impl NoeioDaemon {
         stun_probe(daemon.clone());
 
         register_host_info(daemon.clone());
+
+        wg_timers(daemon.clone());
         daemon
     }
 
@@ -104,14 +112,28 @@ impl NoeioDaemon {
         Ok(())
     }
 
-    pub async fn common_send(&self, peer: &Peer, payload: &Vec<u8>) -> std::io::Result<usize> {
+    /// Send one tunnel datagram (WG ciphertext or protocol traffic) to `peer`,
+    /// choosing the path and the envelope together:
+    ///
+    /// - direct: a `Delivery` stamped with our own id in the peer's network,
+    ///   so the receiver can resolve us (and our tunnel session) immediately;
+    /// - relay: a `Forward` naming the destination peer; the derper rewrites
+    ///   it into a `Delivery` stamped with our id, which it authenticates from
+    ///   its own peer table rather than trusting the packet.
+    pub async fn send_to_peer(&self, peer: &Peer, datagram: &[u8]) -> std::io::Result<usize> {
         if let Some(nat_addr) = peer.address() {
-            tracing::info!(
+            let header = PacketHeader {
+                packet_type: NoeioPacketType::Delivery,
+                peer_id: peer.local_peer_id,
+                port: 0,
+            };
+            let bytes: Vec<u8> = NoeioPacket::new(header, datagram).into();
+            tracing::debug!(
                 peer_id = peer.info.peer_id,
                 %nat_addr,
-                "common_send: direct path",
+                "send_to_peer: direct path",
             );
-            return self.udp.send_to(payload, nat_addr).await;
+            return self.udp.send_to(&bytes, nat_addr).await;
         }
 
         let derper = match self.derper.current().await {
@@ -122,12 +144,18 @@ impl NoeioDaemon {
             Some(derper) => derper,
         };
 
-        tracing::info!(
+        let header = PacketHeader {
+            packet_type: NoeioPacketType::Forward,
+            peer_id: peer.info.peer_id,
+            port: 0,
+        };
+        let bytes: Vec<u8> = NoeioPacket::new(header, datagram).into();
+        tracing::debug!(
             peer_id = peer.info.peer_id,
             derper = %derper.address,
-            "common_send: relay path",
+            "send_to_peer: relay path",
         );
-        self.udp.send_to(&payload, derper.address).await
+        self.udp.send_to(&bytes, derper.address).await
     }
 }
 
@@ -163,16 +191,24 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
                             Some(peer) => peer.clone(),
                         };
 
-                        let header = PacketHeader {
-                            packet_type: NoeioPacketType::Forward,
-                            peer_id: peer.info.peer_id,
-                            port: 0,
-                        };
-
-                        let payload: Vec<u8> = NoeioPacket::new(header, ip_bytes).into();
-
-                        if let Err(err) = state.common_send(&peer, &payload).await {
-                            tracing::error!("Failed to send packet: {}", err);
+                        let mut wg_buf = [0u8; WG_BUFFER_SIZE];
+                        match peer.codec.encapsulate(ip_bytes, &mut wg_buf) {
+                            TunnOutput::ToPeer(datagram) => {
+                                if let Err(err) = state.send_to_peer(&peer, datagram).await {
+                                    tracing::error!("Failed to send packet: {}", err);
+                                }
+                            }
+                            TunnOutput::Err(err) => {
+                                tracing::warn!(
+                                    peer_id = peer.info.peer_id,
+                                    "encapsulate failed: {}",
+                                    err
+                                );
+                            }
+                            // Consumed means the packet was queued while the
+                            // handshake is in flight; encapsulating plaintext
+                            // never produces ToNic.
+                            _ => {}
                         }
                     }
                 }
@@ -289,45 +325,55 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
         loop {
             match state.udp.recv_from(&mut buf).await {
                 Ok((n, addr)) => {
+                    // A datagram that fills the buffer was likely truncated by
+                    // `recv_from`; a clipped ciphertext would only fail
+                    // decryption later, so drop it while the cause is visible.
+                    if n >= MAX_BUFFER_SIZE {
+                        tracing::warn!(
+                            source = %addr,
+                            "dropping datagram: fills the {}-byte buffer, likely truncated",
+                            MAX_BUFFER_SIZE
+                        );
+                        continue;
+                    }
                     if let Ok(packet) = NoeioPacket::try_from(&buf[..n])
                         && let Some(header) = packet.parse_header()
                     {
                         match header.packet_type {
                             NoeioPacketType::Ping => {}
                             NoeioPacketType::Forward => {
-                                if let Some(mut nic) = state.nics.get_mut(&header.peer_id) {
-                                    let mut data = vec![];
-                                    if let Some(payload) = packet.payload() {
-                                        data = payload.to_vec();
-                                    }
-
-                                    tracing::info!("ready to send packet: {:?}", &data);
-
-                                    // TODO: macOS utun requires a 4-byte AF_INET prefix on
-                                    // writes; the tun crate (0.8.6) doesn't prepend it for us.
-                                    // Move this into a VirtualNic wrapper once the bug is
-                                    // confirmed end-to-end.
-                                    #[cfg(target_os = "macos")]
-                                    let data = {
-                                        let mut framed = Vec::with_capacity(4 + data.len());
-                                        framed.extend_from_slice(&[0, 0, 0, 2]); // AF_INET, big-endian
-                                        framed.extend_from_slice(&data);
-                                        framed
-                                    };
-
-                                    if let Err(err) = nic.writer.write(data.as_slice()).await {
-                                        tracing::error!(
-                                            "Failed to write to {} nic: {}",
-                                            header.peer_id,
-                                            err
+                                // Forward is derper-bound ("relay this to the
+                                // peer it names"); a node receiving one means
+                                // the sender speaks the old plaintext protocol.
+                                tracing::warn!(
+                                    source = %addr,
+                                    "dropping forward packet: nodes only accept delivery"
+                                );
+                            }
+                            NoeioPacketType::Delivery => {
+                                // Stamped with the *sender's* peer id — by the
+                                // derper on the relay path, by the sender
+                                // itself on the direct path (a forged id is
+                                // harmless: the wrong session fails to
+                                // decrypt).
+                                let Some(payload) = packet.payload() else {
+                                    continue;
+                                };
+                                // Clone the peer out so the router guard drops
+                                // before we await (same rule as
+                                // `dispatch_signalling`).
+                                let peer = match state.router.get_by_peer_id(&header.peer_id) {
+                                    Some(peer) => peer.clone(),
+                                    None => {
+                                        tracing::warn!(
+                                            source = %addr,
+                                            sender = header.peer_id,
+                                            "dropping delivery from unknown peer"
                                         );
                                         continue;
                                     }
-
-                                    tracing::info!("sent packet to {}", header.peer_id);
-                                } else {
-                                    tracing::error!("can't get nic for peer {}", header.peer_id);
-                                }
+                                };
+                                handle_delivery(&state, &peer, payload, addr).await;
                             }
                             NoeioPacketType::SyncRoute => {
                                 // Route pushes are only trusted from the derper
@@ -447,6 +493,109 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                 }
                 Err(err) => {
                     tracing::error!("UDP recv error: {}", err);
+                }
+            }
+        }
+    });
+}
+
+/// Decrypt one inbound `Delivery` datagram from `peer` and act on everything
+/// the codec produces: plaintext goes to the nic we registered in this peer's
+/// network, protocol replies (handshake responses, keepalives, queued data
+/// packets) go back to the peer.
+async fn handle_delivery(
+    state: &Arc<NoeioDaemon>,
+    peer: &Peer,
+    payload: &[u8],
+    src: SocketAddr,
+) {
+    let mut input: &[u8] = payload;
+    loop {
+        let mut buf = [0u8; WG_BUFFER_SIZE];
+        match peer.codec.decapsulate(Some(src.ip()), input, &mut buf) {
+            TunnOutput::ToNic(plaintext, inner_src) => {
+                // Anti-spoofing: the decrypted packet must claim the virtual
+                // IP of the peer whose session decrypted it.
+                if let Some(ip) = inner_src
+                    && ip != peer.info.noeio_ip
+                {
+                    tracing::warn!(
+                        peer_id = peer.info.peer_id,
+                        %ip,
+                        "dropping packet: inner source doesn't match peer"
+                    );
+                    break;
+                }
+                write_to_nic(state, peer.local_peer_id, plaintext).await;
+                break;
+            }
+            TunnOutput::ToPeer(reply) => {
+                if let Err(err) = state.send_to_peer(peer, reply).await {
+                    tracing::error!("failed to send tunnel reply: {}", err);
+                    break;
+                }
+                // A repeated call with an empty datagram flushes anything else
+                // the codec queued behind this reply.
+                input = &[];
+            }
+            TunnOutput::Consumed => break,
+            TunnOutput::Err(err) => {
+                tracing::warn!(peer_id = peer.info.peer_id, "decapsulate failed: {}", err);
+                break;
+            }
+        }
+    }
+}
+
+/// Write one plaintext IP packet to the nic registered under `nic_id`.
+async fn write_to_nic(state: &Arc<NoeioDaemon>, nic_id: PeerId, packet: &[u8]) {
+    let Some(mut nic) = state.nics.get_mut(&nic_id) else {
+        tracing::error!("can't get nic for peer {}", nic_id);
+        return;
+    };
+
+    // TODO: macOS utun requires a 4-byte AF_INET prefix on writes; the tun
+    // crate (0.8.6) doesn't prepend it for us. Move this into a VirtualNic
+    // wrapper once the bug is confirmed end-to-end.
+    #[cfg(target_os = "macos")]
+    let framed = {
+        let mut framed = Vec::with_capacity(4 + packet.len());
+        framed.extend_from_slice(&[0, 0, 0, 2]); // AF_INET, big-endian
+        framed.extend_from_slice(packet);
+        framed
+    };
+    #[cfg(target_os = "macos")]
+    let packet: &[u8] = &framed;
+
+    if let Err(err) = nic.writer.write(packet).await {
+        tracing::error!("Failed to write to {} nic: {}", nic_id, err);
+    }
+}
+
+/// Drive every peer codec's clock: rekeys, handshake retransmissions, and
+/// keepalives all originate here, ticking at [`WG_TIMER_TICK_MILLIS`].
+fn wg_timers(daemon: Arc<NoeioDaemon>) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(core::time::Duration::from_millis(WG_TIMER_TICK_MILLIS));
+        loop {
+            interval.tick().await;
+            // Snapshot the peers so no router guard is held across the awaits
+            // below.
+            for peer in daemon.router.peers() {
+                let mut buf = [0u8; WG_BUFFER_SIZE];
+                match peer.codec.update_timers(&mut buf) {
+                    TunnOutput::ToPeer(datagram) => {
+                        if let Err(err) = daemon.send_to_peer(&peer, datagram).await {
+                            tracing::error!("failed to send timer packet: {}", err);
+                        }
+                    }
+                    // Idle tunnels report expiry here on every tick; that's
+                    // state, not an event worth logging above trace.
+                    TunnOutput::Err(err) => {
+                        tracing::trace!(peer_id = peer.info.peer_id, "update_timers: {}", err);
+                    }
+                    _ => {}
                 }
             }
         }

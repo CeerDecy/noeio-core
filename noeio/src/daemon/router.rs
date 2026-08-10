@@ -70,4 +70,9 @@ impl Router {
     pub fn ips(&self) -> Vec<IpAddr> {
         self.peers.iter().map(|entry| *entry.key()).collect()
     }
+
+    /// Snapshot of all known peers (cloned out, so no shard guard is held).
+    pub fn peers(&self) -> Vec<Peer> {
+        self.peers.iter().map(|entry| entry.value().clone()).collect()
+    }
 }

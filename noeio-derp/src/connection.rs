@@ -118,6 +118,11 @@ impl ConnectionManager {
                 match packet.packet_type {
                     NoeioPacketType::Ping => {}
                     NoeioPacketType::Forward => {
+                        // A Forward is addressed *to us*: its peer_id names the
+                        // destination peer. Before relaying we rewrite it into a
+                        // Delivery stamped with the *sender's* peer id, so the
+                        // receiver can resolve the sending peer (e.g. to pick
+                        // the right tunnel session) and knows not to re-forward.
                         let header = match packet.parse_header() {
                             None => {
                                 tracing::error!("invalid header {:?}", packet.inner);
@@ -126,20 +131,46 @@ impl ConnectionManager {
                             Some(header) => header,
                         };
 
-                        match manager.get(&header.peer_id) {
+                        let (target_addr, _, target_network) = match manager.get(&header.peer_id) {
                             None => {
                                 tracing::error!("no peer found {}", &header.peer_id);
                                 continue;
                             }
-                            Some((addr, _, _)) => {
-                                let payload = packet.inner.to_vec();
-                                if let Err(err) = udp.send_to(&payload, addr).await {
-                                    tracing::error!("failed to send packet: {}", err);
-                                }
-                            }
+                            Some(entry) => entry,
+                        };
+
+                        // The sender's identity comes from our own peer table
+                        // (fed by token-verified Reports), not from anything the
+                        // sender claims in the packet, so it can't be spoofed by
+                        // another network member.
+                        let Some(sender_id) = manager.peer_id_by_addr(&addr, &target_network)
+                        else {
+                            tracing::warn!(
+                                source = %addr,
+                                target = header.peer_id,
+                                "dropping forward from unregistered sender"
+                            );
+                            continue;
+                        };
+
+                        let mut packet = packet;
+                        packet.set_header(PacketHeader {
+                            packet_type: NoeioPacketType::Delivery,
+                            peer_id: sender_id,
+                            port: header.port,
+                        });
+
+                        if let Err(err) = udp.send_to(&packet.inner, target_addr).await {
+                            tracing::error!("failed to send packet: {}", err);
                         }
                     }
                     NoeioPacketType::SyncRoute => {}
+                    NoeioPacketType::Delivery => {
+                        // Delivery is the relay's *output*, addressed to a final
+                        // receiver; one arriving here is misrouted. Never relay
+                        // it (that would let a sender forge the sender stamp).
+                        tracing::warn!(source = %addr, "dropping delivery packet sent to relay");
+                    }
                     NoeioPacketType::Seq
                     | NoeioPacketType::Ack
                     | NoeioPacketType::KeepAlive => {
@@ -290,6 +321,18 @@ async fn handle_udp_recv(
     addr: SocketAddr,
     sender: &Sender<(SocketAddr, NoeioPacket)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `recv_from` silently truncates datagrams longer than the buffer; a
+    // truncated ciphertext relayed onward would just fail decryption at the
+    // receiver, so drop it here where the cause is still visible. Can't
+    // happen while nodes keep NIC_MTU well below this size.
+    if data.len() >= MAX_PACKET_LEN {
+        return Err(format!(
+            "dropping datagram from {}: fills the {}-byte buffer, likely truncated",
+            addr, MAX_PACKET_LEN
+        )
+        .into());
+    }
+
     let data = data.to_vec();
     let mut packet = NoeioPacket::try_from(data)?;
 
