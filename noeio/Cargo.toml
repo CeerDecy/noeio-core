@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 noeio-common = { workspace = true }
-noeio-proto = { workspace = true }
+noeio-proto = { workspace = true, features = ["noeio"] }
 uuid = { workspace = true }
 tun = { workspace = true, features = ["async"] }
 tokio = { workspace = true, features = ["full"] }

@@ -1,7 +1,7 @@
-use noeio_proto::proto::nic::virtual_nic_service_client::VirtualNicServiceClient;
-use noeio_proto::proto::nic::CreateVirtualNicRequest;
-use noeio_proto::proto::network::network_service_client::NetworkServiceClient;
-use noeio_proto::proto::network::{CreateNetworkRequest, ListNetworkRequest};
+use noeio_proto::proto::noeio::v1::virtual_nic_service_client::VirtualNicServiceClient;
+use noeio_proto::proto::noeio::v1::CreateVirtualNicRequest;
+use noeio_proto::proto::noeio::v1::network_service_client::NetworkServiceClient;
+use noeio_proto::proto::noeio::v1::{CreateNetworkRequest, ListNetworkRequest};
 use tonic::transport::Channel;
 use crate::rpc::outgoing;
 

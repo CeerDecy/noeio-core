@@ -1,8 +1,12 @@
+use crate::config::Config;
 use crate::connection::peer::PeerManager;
-use noeio_common::host_info::HostInfo;
+use crate::token;
+use noeio_common::host_info::NetworkId;
+use noeio_common::packet::report::ReportPayload;
 use noeio_common::packet::{
     MAX_PACKET_LEN, NoeioPacket, NoeioPacketType, PacketHeader, PingPacketPayload,
 };
+use uuid::Uuid;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -20,11 +24,13 @@ pub struct ConnectionManager {
     sender: Sender<(SocketAddr, NoeioPacket)>,
     shutdown: watch::Receiver<bool>,
     task: JoinSet<()>,
+    config: Config,
 }
 
 impl ConnectionManager {
     pub async fn new(
         port: u16,
+        config: Config,
         sender: Sender<(SocketAddr, NoeioPacket)>,
         reader: Receiver<(SocketAddr, NoeioPacket)>,
         shutdown: watch::Receiver<bool>,
@@ -41,6 +47,7 @@ impl ConnectionManager {
             sender,
             shutdown,
             task,
+            config,
         };
 
         manager.handle_connect();
@@ -95,6 +102,7 @@ impl ConnectionManager {
     fn handle_packet_recv(&mut self, mut reader: Receiver<(SocketAddr, NoeioPacket)>) {
         let manager = self.peer_manager.clone();
         let udp = self.socket.clone();
+        let config = self.config.clone();
         self.task.spawn(async move {
             loop {
                 let (addr, packet) = match reader.recv().await {
@@ -157,22 +165,63 @@ impl ConnectionManager {
                             Some(payload) => payload,
                         };
 
-                        if let Ok(host_info) = HostInfo::try_from(payload) {
-                            tracing::info!(
-                                "received a sync route from {} peer_id={} {:?}",
-                                addr,
-                                header.peer_id,
-                                host_info
-                            );
-
-                            for info in &host_info.peers {
-                                manager.heartbeat(
-                                    info.peer_id,
-                                    host_info.clone(),
-                                    addr,
-                                    info.network_id,
-                                );
+                        let report = match ReportPayload::try_from(payload) {
+                            Ok(report) => report,
+                            Err(err) => {
+                                tracing::warn!(source = %addr, "invalid report payload: {}", err);
+                                continue;
                             }
+                        };
+
+                        // Reject reports whose token doesn't verify. No reply
+                        // is sent: probers learn nothing.
+                        let claims = match token::verify(&config.auth.secret, &report.token) {
+                            Ok(claims) => claims,
+                            Err(err) => {
+                                tracing::warn!(source = %addr, "rejected report: {}", err);
+                                continue;
+                            }
+                        };
+
+                        // The token is scoped to one network (`sub`); peers
+                        // reported outside it are dropped.
+                        let token_network: NetworkId = match Uuid::parse_str(&claims.sub) {
+                            Ok(uuid) => uuid.into_bytes(),
+                            Err(err) => {
+                                tracing::warn!(
+                                    source = %addr,
+                                    sub = %claims.sub,
+                                    "rejected report: token sub is not a network uuid: {}",
+                                    err
+                                );
+                                continue;
+                            }
+                        };
+
+                        let host_info = report.host_info;
+                        tracing::info!(
+                            "received a report from {} peer_id={} {:?}",
+                            addr,
+                            header.peer_id,
+                            host_info
+                        );
+
+                        for info in &host_info.peers {
+                            if info.network_id != token_network {
+                                tracing::warn!(
+                                    source = %addr,
+                                    peer = %info.peer_id,
+                                    "dropping reported peer outside the token's network"
+                                );
+                                continue;
+                            }
+
+                            manager.heartbeat(
+                                info.peer_id,
+                                host_info.clone(),
+                                addr,
+                                info.network_id,
+                            );
                         }
                     }
                 }

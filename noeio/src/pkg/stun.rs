@@ -131,19 +131,3 @@ impl StunClient {
         None
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    use tokio::time;
-    #[tokio::test]
-    async fn test_stun_client() {
-        let factory =
-            StunClientFactory::new(Arc::new(UdpSocket::bind("0.0.0.0:8080").await.unwrap()));
-        let mut client = factory.create("stun.chat.bilibili.com:3478").await.unwrap();
-        let addr = client.get_address().await.unwrap();
-        println!("{}", addr);
-        // time::sleep(Duration::from_secs(10000)).await;
-    }
-}

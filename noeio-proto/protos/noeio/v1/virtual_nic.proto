@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package nic;
+package noeio.v1;
 
 message CreateVirtualNicRequest {
   string ip = 1;

@@ -48,7 +48,17 @@ pub struct Noeio {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Derper {
     #[serde(default)]
-    pub servers: Vec<String>,
+    pub servers: Vec<DerperInfo>,
+}
+
+/// A derper relay endpoint and the credential used when reporting to it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct DerperInfo {
+    pub address: String,
+    /// Report token issued by this derper (empty when not configured yet —
+    /// the derper decides whether to accept unauthenticated reports).
+    #[serde(default)]
+    pub token: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package network;
+package noeio.v1;
 
 message Network {
   string name = 1;

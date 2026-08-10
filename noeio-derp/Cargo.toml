@@ -5,9 +5,20 @@ edition = "2024"
 
 [dependencies]
 noeio-common = { workspace = true }
+noeio-proto = { workspace = true, features = ["noeio-derper"] }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true, features = ["derive"] }
 dashmap = { workspace = true }
 moka = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+rand = { workspace = true }
+jsonwebtoken = { workspace = true }
+uuid = { workspace = true }
+tonic = { workspace = true, features = ["default"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tower = { workspace = true }
+hyper-util = { workspace = true }

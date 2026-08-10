@@ -1,7 +1,10 @@
+pub mod report;
+mod token_frame;
+
 use bytes::BytesMut;
 use smoltcp::wire::Ipv4Packet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use crate::host_info::{new_peer_id, PeerId};
+use crate::host_info::PeerId;
 
 pub static MAX_PACKET_LEN: usize = 2048;
 
@@ -163,28 +166,20 @@ pub struct NoeioPacket {
 }
 
 impl NoeioPacket {
-    /// Length of the fake IPv4 header prepended to every packet so that a
-    /// WireGuard implementation (e.g. boringtun) accepts it as an inner IP
-    /// packet. See [`Self::fake_ip_header`] for the field layout.
-    pub const IP_HEADER_LEN: usize = 20;
-    /// Length of the noeio [`PacketHeader`] that follows the fake IP header.
+    /// Length of the noeio [`PacketHeader`] at the start of every packet.
     pub const HEADER_LEN: usize = PacketHeader::LEN;
-    /// Offset of the noeio payload within `inner` (fake IP header + noeio header).
-    pub const PAYLOAD_OFFSET: usize = Self::IP_HEADER_LEN + Self::HEADER_LEN;
+    /// Offset of the noeio payload within `inner`.
+    pub const PAYLOAD_OFFSET: usize = Self::HEADER_LEN;
 
     /// Build a packet from a header and payload.
     ///
     /// `inner` is the wire representation, laid out as
-    /// `[20-byte fake IPv4 header][9-byte noeio header][payload]`. The fake IP
-    /// header lets the bytes masquerade as an inner IPv4 packet through a
-    /// WireGuard tunnel; parsing routines skip it. `packet_type` mirrors the
-    /// header so callers can match on it without re-parsing.
+    /// `[9-byte noeio header][payload]`. `packet_type` mirrors the header so
+    /// callers can match on it without re-parsing.
     pub fn new(header: PacketHeader, payload: &[u8]) -> Self {
         let header_bytes = header.to_bytes();
-        let total_len = Self::IP_HEADER_LEN + header_bytes.len() + payload.len();
 
-        let mut inner = BytesMut::with_capacity(total_len);
-        inner.extend_from_slice(&Self::fake_ip_header(total_len));
+        let mut inner = BytesMut::with_capacity(header_bytes.len() + payload.len());
         inner.extend_from_slice(&header_bytes);
         inner.extend_from_slice(payload);
 
@@ -194,19 +189,8 @@ impl NoeioPacket {
         }
     }
 
-    /// Construct a minimal IPv4 header that a WireGuard implementation will
-    /// accept. Only version/IHL (`0x45`) and Total Length are meaningful; all
-    /// other fields are inert placeholders that peers do not inspect.
-    fn fake_ip_header(total_len: usize) -> [u8; Self::IP_HEADER_LEN] {
-        let mut ip = [0u8; Self::IP_HEADER_LEN];
-        ip[0] = 0x45; // version 4, IHL 5 (20-byte header)
-        ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes()); // Total Length
-        ip[8] = 64; // TTL
-        ip
-    }
-
     pub fn parse_header(&self) -> Option<PacketHeader> {
-        PacketHeader::from_bytes(self.inner.get(Self::IP_HEADER_LEN..)?)
+        PacketHeader::from_bytes(&self.inner)
     }
 
     pub fn set_header(&mut self, header: PacketHeader) {
@@ -216,7 +200,7 @@ impl NoeioPacket {
             self.inner.resize(Self::PAYLOAD_OFFSET, 0);
         }
 
-        self.inner[Self::IP_HEADER_LEN..Self::PAYLOAD_OFFSET].copy_from_slice(&header_bytes);
+        self.inner[..Self::PAYLOAD_OFFSET].copy_from_slice(&header_bytes);
         self.packet_type = header.packet_type;
     }
 
@@ -260,9 +244,7 @@ impl NoeioPacket {
             ..PacketHeader::default()
         });
         self.inner.resize(Self::PAYLOAD_OFFSET, 0);
-        self.inner[..Self::IP_HEADER_LEN]
-            .copy_from_slice(&Self::fake_ip_header(Self::PAYLOAD_OFFSET));
-        self.inner[Self::IP_HEADER_LEN..Self::PAYLOAD_OFFSET].copy_from_slice(&header.to_bytes());
+        self.inner[..Self::PAYLOAD_OFFSET].copy_from_slice(&header.to_bytes());
     }
 }
 
@@ -309,11 +291,7 @@ impl TryFrom<&[u8]> for NoeioPacket {
     type Error = &'static str;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        // Skip the 20-byte fake IPv4 header, then parse the noeio header.
-        let header_bytes = value
-            .get(NoeioPacket::IP_HEADER_LEN..)
-            .ok_or("invalid noeio packet: shorter than fake IP header")?;
-        let header = PacketHeader::from_bytes(header_bytes)
+        let header = PacketHeader::from_bytes(value)
             .ok_or("invalid noeio packet: failed to parse header")?;
 
         Ok(NoeioPacket {
@@ -346,8 +324,9 @@ impl From<&NoeioPacket> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_info::new_peer_id;
 
-    /// Wire bytes for a packet: fake IP header + noeio header + payload.
+    /// Wire bytes for a packet: noeio header + payload.
     fn wire_bytes(header: &PacketHeader, payload: &[u8]) -> Vec<u8> {
         Vec::from(NoeioPacket::new(*header, payload))
     }
@@ -398,10 +377,8 @@ mod tests {
 
     #[test]
     fn noeio_packet_to_vec() {
-        // 20-byte fake IP header, then noeio header [magic, type, peer_id, port], then payload.
-        let noeio = vec![0x4E, 0x4F, 1, 10, 0, 0, 8, 0xCA, 0x6C, 9, 8, 7];
-        let mut bytes = vec![0u8; NoeioPacket::IP_HEADER_LEN];
-        bytes.extend_from_slice(&noeio);
+        // noeio header [magic, type, peer_id, port], then payload.
+        let bytes = vec![0x4E, 0x4F, 1, 10, 0, 0, 8, 0xCA, 0x6C, 9, 8, 7];
 
         let packet = NoeioPacket::try_from(bytes.clone()).unwrap();
 
@@ -410,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn noeio_packet_new_prepends_fake_ip_header() {
+    fn noeio_packet_new_layout_is_header_then_payload() {
         let header = PacketHeader {
             packet_type: NoeioPacketType::Forward,
             peer_id: 42,
@@ -419,16 +396,10 @@ mod tests {
         let payload = [1u8, 2, 3, 4];
         let bytes = Vec::from(NoeioPacket::new(header, &payload));
 
-        // version 4 / IHL 5, and Total Length covers the whole buffer.
-        assert_eq!(bytes[0], 0x45);
-        let total_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
-        assert_eq!(total_len, bytes.len());
-        assert_eq!(
-            bytes.len(),
-            NoeioPacket::PAYLOAD_OFFSET + payload.len()
-        );
+        assert_eq!(bytes.len(), NoeioPacket::PAYLOAD_OFFSET + payload.len());
+        assert_eq!(&bytes[0..2], &PacketHeader::MAGIC);
 
-        // Header and payload survive a round-trip past the fake IP header.
+        // Header and payload survive a round-trip.
         let packet = NoeioPacket::try_from(bytes).unwrap();
         assert_eq!(packet.parse_header(), Some(header));
         assert_eq!(packet.payload(), Some(payload.as_slice()));

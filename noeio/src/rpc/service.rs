@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use crate::rpc::service::network::NetworkServiceImpl;
 use crate::daemon::NoeioDaemon;
-use noeio_proto::proto::network::network_service_server::NetworkServiceServer;
+use noeio_proto::proto::noeio::v1::network_service_server::NetworkServiceServer;
 use tonic::transport::Server;
-use noeio_proto::proto::nic::virtual_nic_service_server::VirtualNicServiceServer;
+use noeio_proto::proto::noeio::v1::virtual_nic_service_server::VirtualNicServiceServer;
 use crate::rpc::incoming;
 use crate::rpc::service::nic::VirtualNicServiceImpl;
 

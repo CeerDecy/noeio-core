@@ -1,7 +1,7 @@
 use crate::interface::virtual_nic::VirtualNic;
 use crate::daemon::NoeioDaemon;
-use noeio_proto::proto::network::network_service_server::NetworkService;
-use noeio_proto::proto::network::{CreateNetworkRequest, CreateNetworkResponse, ListNetworkRequest, ListNetworkResponse, Network};
+use noeio_proto::proto::noeio::v1::network_service_server::NetworkService;
+use noeio_proto::proto::noeio::v1::{CreateNetworkRequest, CreateNetworkResponse, ListNetworkRequest, ListNetworkResponse, Network};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};

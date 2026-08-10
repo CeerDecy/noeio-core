@@ -16,6 +16,7 @@ use crate::interface::virtual_nic::VirtualNic;
 use bytecodec::{DecodeExt, EncodeExt, Error as BytecodecError};
 use noeio_common::host_info;
 use noeio_common::host_info::{HostInfo, NatType, PeerId, PeerInfo};
+use noeio_common::packet::report::ReportPayload;
 use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader};
 use smoltcp::wire::Ipv4Packet;
 use std::net::{IpAddr, SocketAddr};
@@ -123,10 +124,10 @@ impl NoeioDaemon {
 
         tracing::info!(
             peer_id = peer.info.peer_id,
-            %derper,
+            derper = %derper.address,
             "common_send: relay path",
         );
-        self.udp.send_to(&payload, derper).await
+        self.udp.send_to(&payload, derper.address).await
     }
 }
 
@@ -188,42 +189,52 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
         loop {
             tokio::time::sleep(core::time::Duration::from_secs(10)).await;
 
-            if let Some(derper_addr) = daemon.derper.current().await
-                && let Some(host_info) = daemon.host_info.lock().await.clone()
-            {
-                let addr = match derper_addr.parse::<SocketAddr>() {
-                    Ok(addr) => addr,
-                    Err(err) => {
-                        tracing::error!("failed to parse derper address: {}", err);
-                        continue;
-                    }
-                };
+            let Some(derper) = daemon.derper.current().await else {
+                tracing::warn!("report skipped: no derper server selected, check [derper] config");
+                continue;
+            };
 
-                let payload = host_info.to_bytes();
-                let mut header = PacketHeader::default();
+            let Some(host_info) = daemon.host_info.lock().await.clone() else {
+                tracing::warn!(
+                    "report skipped: host_info not initialized, waiting for a STUN response"
+                );
+                continue;
+            };
 
-                if daemon.nics.peers().len() <= 0 {
-                    tracing::warn!("no nic found");
+            let addr = match derper.address.parse::<SocketAddr>() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    tracing::error!(
+                        "failed to parse derper address '{}': {}",
+                        derper.address,
+                        err
+                    );
                     continue;
                 }
+            };
 
-                // TODO
-                let peer_id = daemon.nics.peers()[0];
+            let payload = ReportPayload::new(derper.token.clone(), host_info).to_bytes();
+            let mut header = PacketHeader::default();
 
-                tracing::info!(peer = %peer_id, "peer id");
-
-                header.packet_type = NoeioPacketType::Report;
-                header.peer_id = peer_id;
-
-                let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
-
-                if let Err(err) = daemon.udp.send_to(&packet, addr).await {
-                    tracing::error!("failed to send host info: {}", err);
-                }
-                tracing::info!("host info sent to {}", addr);
-            } else {
-                tracing::error!("failed to parse host_info");
+            if daemon.nics.peers().len() <= 0 {
+                tracing::warn!("report skipped: no nic registered");
+                continue;
             }
+
+            // TODO
+            let peer_id = daemon.nics.peers()[0];
+
+            tracing::info!(peer = %peer_id, "peer id");
+
+            header.packet_type = NoeioPacketType::Report;
+            header.peer_id = peer_id;
+
+            let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
+
+            if let Err(err) = daemon.udp.send_to(&packet, addr).await {
+                tracing::error!("failed to send host info: {}", err);
+            }
+            tracing::info!("host info sent to {}", addr);
         }
     });
 }
@@ -319,6 +330,22 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                 }
                             }
                             NoeioPacketType::SyncRoute => {
+                                // Route pushes are only trusted from the derper
+                                // we are configured to talk to; drop spoofed ones.
+                                let derper_ip = state
+                                    .derper
+                                    .current()
+                                    .await
+                                    .and_then(|d| d.address.parse::<SocketAddr>().ok())
+                                    .map(|a| a.ip());
+                                if derper_ip != Some(addr.ip()) {
+                                    tracing::warn!(
+                                        source = %addr,
+                                        "dropping SyncRoute from unexpected source"
+                                    );
+                                    continue;
+                                }
+
                                 if let Some(payload) = packet.payload() {
                                     match PeerInfo::try_from(payload) {
                                         Ok(peer) => {

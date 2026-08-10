@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package noeio.derper.v1;
+
+message CreateTokenRequest {
+  string network_id = 1;
+  // Unset means the server default TTL; 0 means the token never expires.
+  optional uint64 ttl_seconds = 2;
+}
+
+message CreateTokenResponse {
+  string token = 1;
+  // Unix timestamp (seconds) at which the token expires.
+  // Unset when the token never expires.
+  optional uint64 expires_at = 2;
+}
+
+message VerifyTokenRequest {
+  string token = 1;
+}
+
+message TokenClaims {
+  string iss = 1;
+  // Network UUID the token is scoped to.
+  string sub = 2;
+  uint64 iat = 3;
+  // Unset when the token never expires.
+  optional uint64 exp = 4;
+}
+
+message VerifyTokenResponse {
+  bool valid = 1;
+  // Why the token is unusable, e.g. "expired", "invalid signature".
+  // Unset when valid.
+  optional string reason = 2;
+  // Decoded claims. Present when the token payload could be decoded with a
+  // valid signature (including expired tokens); absent for malformed or
+  // forged tokens.
+  optional TokenClaims claims = 3;
+}
+
+service TokenService {
+  rpc CreateToken (CreateTokenRequest) returns (CreateTokenResponse);
+  rpc VerifyToken (VerifyTokenRequest) returns (VerifyTokenResponse);
+}

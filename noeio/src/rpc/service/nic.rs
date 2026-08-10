@@ -1,7 +1,7 @@
 use crate::daemon::NoeioDaemon;
 use crate::interface::virtual_nic::VirtualNic;
-use noeio_proto::proto::nic::virtual_nic_service_server::VirtualNicService;
-use noeio_proto::proto::nic::{CreateVirtualNicRequest, CreateVirtualNicResponse};
+use noeio_proto::proto::noeio::v1::virtual_nic_service_server::VirtualNicService;
+use noeio_proto::proto::noeio::v1::{CreateVirtualNicRequest, CreateVirtualNicResponse};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};

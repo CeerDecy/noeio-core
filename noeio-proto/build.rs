@@ -19,8 +19,20 @@ fn collect_proto_files(dir: &Path) -> Vec<PathBuf> {
 
 fn main() {
     let proto_dir = PathBuf::from("./protos");
-    let proto_files = collect_proto_files(&proto_dir);
+
+    // Each cargo feature maps to one proto sub-tree.
+    let mut proto_files = Vec::new();
+    if env::var_os("CARGO_FEATURE_NOEIO").is_some() {
+        proto_files.extend(collect_proto_files(&proto_dir.join("noeio")));
+    }
+    if env::var_os("CARGO_FEATURE_NOEIO_DERPER").is_some() {
+        proto_files.extend(collect_proto_files(&proto_dir.join("noeio-derper")));
+    }
     println!("Generated files: {:?}", proto_files);
+
+    if proto_files.is_empty() {
+        return;
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 

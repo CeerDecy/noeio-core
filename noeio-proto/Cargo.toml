@@ -3,6 +3,11 @@ name = "noeio-proto"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+noeio = []
+noeio-derper = []
+
 [dependencies]
 tonic = { workspace = true }
 prost = { workspace = true }
