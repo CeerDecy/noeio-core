@@ -29,6 +29,26 @@ Noeio 是一个纯数据面组件：只负责组网本身，不内置 Tailscale 
 
 每个节点运行一个 noeio daemon，向自部署的 derper 上报自己的地址和 NAT 类型；derper 通过 SyncRoute 把各节点的路径候选广播回去。节点间的流量在存在直连路径时走 WireGuard 加密的直连，否则回退到经 derper 中继转发。
 
+## 安装
+
+前置条件：[Rust 工具链](https://rustup.rs/) 和 `protoc`（protobuf 编译器）——Linux 用 `apt install protobuf-compiler`，macOS 用 `brew install protobuf`；Windows 可用 `choco install protoc` / `scoop install protobuf`，或从 [protobuf releases](https://github.com/protocolbuffers/protobuf/releases) 下载 `protoc-*-win64.zip` 并加入 `PATH`。二进制由 cargo 在本机编译，因此任意平台均适用。
+
+### derper
+
+derper 需要部署在一台所有节点都能访问到的机器上，一般是一台带公网 IP 的云厂商机器：
+
+```bash
+cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
+```
+
+### noeio
+
+在每个需要加入虚拟网络的节点上安装 noeio daemon：
+
+```bash
+cargo install --git https://github.com/CeerDecy/noeio-core noeio
+```
+
 ## 快速开始
 
 1. 启动 derper 中继。derper 需要部署在一台所有节点都能访问到的机器上，一般是一台带公网 IP 的云厂商机器。
@@ -42,7 +62,7 @@ Noeio 是一个纯数据面组件：只负责组网本身，不内置 Tailscale 
    或二进制方式：
 
    ```bash
-   noeio-derper boot
+   cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp && noeio-derp boot
    ```
 
 2. 生成 derper 认证 token。`--network` 是一个用于标识虚拟网络的 UUID，可以根据自己的需要随意填写其他 UUID；持有同一 UUID token 的节点会加入同一个虚拟网络。

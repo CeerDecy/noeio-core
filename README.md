@@ -29,6 +29,26 @@ Noeio is a pure data-plane component: it only handles networking itself, and shi
 
 Each node runs a noeio daemon that reports its addresses and NAT type to the self-hosted derper; the derper broadcasts every peer's route candidates back via SyncRoute. Traffic between nodes takes a WireGuard-encrypted direct path whenever one exists, and falls back to relaying through the derper otherwise.
 
+## Install
+
+Prerequisites: the [Rust toolchain](https://rustup.rs/) and `protoc` (the protobuf compiler) — `apt install protobuf-compiler` on Linux, `brew install protobuf` on macOS; on Windows use `choco install protoc` / `scoop install protobuf`, or download a `protoc-*-win64.zip` from the [protobuf releases](https://github.com/protocolbuffers/protobuf/releases) and add it to your `PATH`. Binaries are compiled locally by cargo, so this works on any platform.
+
+### derper
+
+The derper must be deployed on a machine reachable by every node — typically a cloud instance with a public IP:
+
+```bash
+cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
+```
+
+### noeio
+
+Install the noeio daemon on every node that joins the virtual network:
+
+```bash
+cargo install --git https://github.com/CeerDecy/noeio-core noeio
+```
+
 ## Quick start
 
 1. Start a derper relay. The derper must be deployed on a machine reachable by every node — typically a cloud instance with a public IP.
@@ -42,7 +62,7 @@ Each node runs a noeio daemon that reports its addresses and NAT type to the sel
    Or with the binary:
 
    ```bash
-   noeio-derper boot
+   cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp && noeio-derp boot
    ```
 
 2. Create a derper auth token for your network. `--network` takes a UUID that identifies a virtual network — feel free to use any UUID of your own; nodes holding a token for the same UUID join the same network.
