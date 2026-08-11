@@ -220,6 +220,34 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
     });
 }
 
+/// The local (LAN) socket addresses to advertise as direct-path candidates.
+///
+/// Deliberately conservative: only the *primary* interface — the one the OS
+/// routes toward the derper — is reported, paired with our UDP `port`.
+/// Secondary interfaces stay unadvertised until a config option exists to opt
+/// them in; when it does, this function is where it plugs in (the wire format
+/// and the receiving side already handle any number of addresses).
+///
+/// The probe socket never sends a packet: UDP `connect` only asks the OS to
+/// resolve the route. Returns an empty list when the route can't be resolved
+/// or the resolved IP is unusable as an underlay candidate — loopback (e.g. a
+/// local dev derper) or one of our own overlay nics (`overlay_ips`), since
+/// traffic to an overlay address goes *through* the tunnel.
+fn report_local_addrs(port: u16, derper: SocketAddr, overlay_ips: &[IpAddr]) -> Vec<SocketAddr> {
+    let primary = || -> Option<IpAddr> {
+        let bind_addr = if derper.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let probe = std::net::UdpSocket::bind(bind_addr).ok()?;
+        probe.connect(derper).ok()?;
+        Some(probe.local_addr().ok()?.ip())
+    };
+    match primary() {
+        Some(ip) if !ip.is_loopback() && !overlay_ips.contains(&ip) => {
+            vec![SocketAddr::new(ip, port)]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn register_host_info(daemon: Arc<NoeioDaemon>) {
     tokio::spawn(async move {
         loop {
@@ -230,7 +258,7 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
                 continue;
             };
 
-            let Some(host_info) = daemon.host_info.lock().await.clone() else {
+            let Some(mut host_info) = daemon.host_info.lock().await.clone() else {
                 tracing::warn!(
                     "report skipped: host_info not initialized, waiting for a STUN response"
                 );
@@ -248,6 +276,19 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
                     continue;
                 }
             };
+
+            // Refresh the LAN candidate on every report: the primary route
+            // can change, and the report is what keeps the derper's view
+            // current.
+            match daemon.udp.local_addr() {
+                Ok(local) => {
+                    host_info.local_addrs =
+                        report_local_addrs(local.port(), addr, &daemon.nics.ips());
+                }
+                Err(err) => {
+                    tracing::warn!("report: failed to read local udp port: {}", err);
+                }
+            }
 
             let payload = ReportPayload::new(derper.token.clone(), host_info).to_bytes();
             let mut header = PacketHeader::default();
@@ -670,6 +711,14 @@ mod tests {
             router: Router::new(),
             task: JoinSet::new(),
         }
+    }
+
+    #[test]
+    fn report_local_addrs_drops_loopback_primary() {
+        // A loopback derper (local dev) resolves to a loopback source, which
+        // is useless as a LAN candidate — nothing must be advertised.
+        let derper = "127.0.0.1:3478".parse().unwrap();
+        assert!(report_local_addrs(41641, derper, &[]).is_empty());
     }
 
     #[tokio::test]

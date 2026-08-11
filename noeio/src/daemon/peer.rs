@@ -87,9 +87,10 @@ fn build_codec(info: &PeerInfo, local_peer_id: PeerId) -> Arc<dyn TunnelSession>
 impl Peer {
     /// Create a peer from its broadcast identity and spawn its selector task.
     ///
-    /// A peer that is not behind a symmetric NAT is directly reachable, so we
-    /// eagerly open a [`UdpTunnelSession`] to it; symmetric-NAT peers can only
-    /// be reached via the relay and start with no direct session.
+    /// A [`UdpTunnelSession`] is eagerly opened toward every candidate address
+    /// (reported LAN addresses, plus the STUN address unless the peer is
+    /// behind a symmetric NAT — see [`Self::candidate_addrs`]); a peer with no
+    /// candidates starts with no direct session and is reached via the relay.
     /// `local_peer_id` is our own id in this peer's network (learned from the
     /// `SyncRoute` header). It is stamped into the Seq/Ack/TunnelPing/TunnelPong
     /// packets the sessions emit so the remote can resolve *us* in its router —
@@ -149,18 +150,28 @@ impl Peer {
         self.codec.read().unwrap().clone()
     }
 
-    /// Candidate addresses for direct paths to this peer.
+    /// Candidate addresses for direct paths to this peer: the LAN addresses
+    /// it reported plus its STUN-observed public address, deduplicated. Each
+    /// candidate gets its own session and a seat in the RTT-based selection.
     ///
-    /// Currently just the STUN-observed public address; additional endpoints
-    /// (e.g. a LAN address) slot in here and automatically get their own
-    /// session and a seat in the RTT-based selection. Empty for a
-    /// symmetric-NAT peer (relay-only) or before the address is learned.
+    /// The symmetric-NAT rule only excludes the STUN path — hole punching
+    /// through a symmetric NAT doesn't work, but a LAN address is reachable
+    /// regardless of the peer's NAT type. Empty when no path is known
+    /// (relay-only).
     fn candidate_addrs(&self) -> Vec<SocketAddr> {
         let info = self.info();
-        if info.nat_type == NatType::Symmetric {
-            return Vec::new();
+        let nat_addr = (info.nat_type != NatType::Symmetric)
+            .then_some(info.nat_addr)
+            .flatten();
+        let mut candidates = Vec::new();
+        for addr in info.local_addrs.into_iter().chain(nat_addr) {
+            // Dedup: a peer with a public interface can report the same
+            // address as both LAN and STUN.
+            if !candidates.contains(&addr) {
+                candidates.push(addr);
+            }
         }
-        info.nat_addr.into_iter().collect()
+        candidates
     }
 
     /// Reconcile the session set against [`Self::candidate_addrs`]. Does
@@ -530,5 +541,39 @@ mod select_session_tests {
         set_selected(&peer, A);
         peer.select_session();
         assert_eq!(selected(&peer), Some(B.parse().unwrap()));
+    }
+
+    fn set_info(peer: &Peer, nat_type: NatType, nat_addr: Option<&str>, local: &[&str]) {
+        let info = peer
+            .info()
+            .with_nat_type(nat_type)
+            .with_nat_addr(nat_addr.map(|a| a.parse().unwrap()))
+            .with_local_addrs(local.iter().map(|a| a.parse().unwrap()).collect());
+        *peer.info.write().unwrap() = info;
+    }
+
+    #[tokio::test]
+    async fn candidates_combine_lan_and_nat_addrs() {
+        let peer = test_peer(Vec::new()).await;
+        set_info(&peer, NatType::Other, Some(A), &[B]);
+        assert_eq!(
+            peer.candidate_addrs(),
+            vec![B.parse().unwrap(), A.parse().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn symmetric_nat_keeps_lan_but_drops_stun_candidate() {
+        let peer = test_peer(Vec::new()).await;
+        set_info(&peer, NatType::Symmetric, Some(A), &[B]);
+        assert_eq!(peer.candidate_addrs(), vec![B.parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_lan_and_stun_addr_yields_one_candidate() {
+        // A peer with a public interface reports the same address both ways.
+        let peer = test_peer(Vec::new()).await;
+        set_info(&peer, NatType::Other, Some(A), &[A]);
+        assert_eq!(peer.candidate_addrs(), vec![A.parse().unwrap()]);
     }
 }

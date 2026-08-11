@@ -68,6 +68,10 @@ pub struct PeerInfo {
     /// STUN-observed public address of the peer, if it has been probed. Used
     /// to open a direct UDP connection for NAT hole punching.
     pub nat_addr: Option<SocketAddr>,
+    /// Addresses of the peer's physical NICs (LAN paths), each paired with its
+    /// daemon's UDP port. Broadcast alongside `nat_addr` so other peers can
+    /// open a tunnel session per candidate and pick the lowest-RTT path.
+    pub local_addrs: Vec<SocketAddr>,
 }
 
 impl PeerInfo {
@@ -79,6 +83,7 @@ impl PeerInfo {
             network_id,
             nat_type: NatType::default(),
             nat_addr: None,
+            local_addrs: Vec::new(),
         })
     }
 
@@ -91,6 +96,34 @@ impl PeerInfo {
         self.nat_addr = nat_addr;
         self
     }
+
+    pub fn with_local_addrs(mut self, local_addrs: Vec<SocketAddr>) -> Self {
+        self.local_addrs = local_addrs;
+        self
+    }
+}
+
+/// Join socket addresses with `|` for the wire (an address never contains a
+/// `|`, `,`, `;`, or `\r\n`, so it nests safely in every layer of the format).
+fn join_addrs(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Parse a `|`-joined address list; empty input means no addresses.
+fn parse_addrs(s: &str) -> Result<Vec<SocketAddr>, std::io::Error> {
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    s.split('|')
+        .map(|a| {
+            a.parse()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .collect()
 }
 
 impl From<&PeerInfo> for String {
@@ -100,12 +133,13 @@ impl From<&PeerInfo> for String {
             .map(|addr| addr.to_string())
             .unwrap_or_default();
         format!(
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{}",
             peer.peer_id,
             peer.noeio_ip,
             Uuid::from_bytes(peer.network_id).hyphenated(),
             peer.nat_type,
-            nat_addr
+            nat_addr,
+            join_addrs(&peer.local_addrs)
         )
     }
 }
@@ -121,12 +155,15 @@ impl TryFrom<&str> for PeerInfo {
 
     fn try_from(entry: &str) -> Result<Self, Self::Error> {
         let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid peer entry");
-        let mut fields = entry.splitn(5, ',');
+        let mut fields = entry.splitn(6, ',');
         let peer_id_str = fields.next().ok_or_else(invalid)?;
         let vip_str = fields.next().ok_or_else(invalid)?;
         let network_str = fields.next().ok_or_else(invalid)?;
         let nat_type_str = fields.next().ok_or_else(invalid)?;
         let nat_addr_str = fields.next().ok_or_else(invalid)?;
+        // Optional trailing field: a sender that predates local-address
+        // reporting emits five fields, which parses as "no LAN candidates".
+        let local_addrs_str = fields.next().unwrap_or("");
 
         let peer_id: PeerId = peer_id_str
             .parse()
@@ -145,8 +182,13 @@ impl TryFrom<&str> for PeerInfo {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
             )
         };
+        let local_addrs = parse_addrs(local_addrs_str)?;
         PeerInfo::new(peer_id, vip, network_str)
-            .map(|peer| peer.with_nat_type(nat_type).with_nat_addr(nat_addr))
+            .map(|peer| {
+                peer.with_nat_type(nat_type)
+                    .with_nat_addr(nat_addr)
+                    .with_local_addrs(local_addrs)
+            })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
@@ -167,6 +209,10 @@ pub struct HostInfo {
     pub nat_addr: SocketAddr,
     pub nat_type: NatType,
     pub hostname: String,
+    /// Addresses of this host's physical NICs paired with its UDP port (LAN
+    /// paths). Host-level like `nat_addr`: the derper stamps them into every
+    /// `PeerInfo` it broadcasts about this host.
+    pub local_addrs: Vec<SocketAddr>,
     pub peers: Vec<PeerInfo>,
 }
 
@@ -180,6 +226,7 @@ impl HostInfo {
             nat_addr,
             nat_type: NatType::default(),
             hostname,
+            local_addrs: Vec::new(),
             peers: Vec::new(),
         }
     }
@@ -189,18 +236,31 @@ impl HostInfo {
         self
     }
 
+    pub fn with_local_addrs(mut self, local_addrs: Vec<SocketAddr>) -> Self {
+        self.local_addrs = local_addrs;
+        self
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         // TODO: replace this ad-hoc text format with a binary encoding (protobuf / bincode)
-        // once the field set stabilizes — the `\r\n` / `;` / `,` layering will not scale.
+        // once the field set stabilizes — the `\r\n` / `;` / `,` / `|` layering will not scale.
         let networks_str: String = self
             .peers
             .iter()
             .map(String::from)
             .collect::<Vec<_>>()
             .join(";");
+        // `local_addrs` deliberately comes last: a legacy sender emits only
+        // the first four segments, and a missing trailing segment parses as
+        // "no LAN candidates" — so an upgraded receiver keeps accepting
+        // legacy reports.
         format!(
-            "{}\r\n{}\r\n{}\r\n{}",
-            self.nat_addr, self.nat_type, self.hostname, networks_str
+            "{}\r\n{}\r\n{}\r\n{}\r\n{}",
+            self.nat_addr,
+            self.nat_type,
+            self.hostname,
+            networks_str,
+            join_addrs(&self.local_addrs)
         )
         .into_bytes()
     }
@@ -212,7 +272,7 @@ impl TryFrom<&[u8]> for HostInfo {
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
         let s = std::str::from_utf8(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut parts = s.splitn(4, "\r\n");
+        let mut parts = s.splitn(5, "\r\n");
         let addr_str = parts
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing addr"))?;
@@ -226,12 +286,17 @@ impl TryFrom<&[u8]> for HostInfo {
             })?
             .to_string();
         let networks_str = parts.next().unwrap_or("");
+        // Optional trailing segment (see `to_bytes`): absent in legacy
+        // payloads, which predate local-address reporting.
+        let local_addrs_str = parts.next().unwrap_or("");
 
         let nat_addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let nat_type: NatType = nat_type_str.parse()?;
+
+        let local_addrs = parse_addrs(local_addrs_str)?;
 
         let networks = if networks_str.is_empty() {
             Vec::new()
@@ -246,6 +311,7 @@ impl TryFrom<&[u8]> for HostInfo {
             nat_addr,
             nat_type,
             hostname,
+            local_addrs,
             peers: networks,
         })
     }
@@ -295,6 +361,7 @@ mod tests {
             nat_addr: sample_addr(),
             nat_type: NatType::Symmetric,
             hostname: "example-host".to_string(),
+            local_addrs: vec!["192.168.1.10:41641".parse().unwrap()],
             peers: nets,
         };
 
@@ -304,6 +371,7 @@ mod tests {
         assert_eq!(parsed.nat_addr, info.nat_addr);
         assert_eq!(parsed.nat_type, info.nat_type);
         assert_eq!(parsed.hostname, info.hostname);
+        assert_eq!(parsed.local_addrs, info.local_addrs);
         assert_eq!(parsed.peers.len(), info.peers.len());
         for (a, b) in parsed.peers.iter().zip(info.peers.iter()) {
             assert_eq!(a.peer_id, b.peer_id);
@@ -319,6 +387,7 @@ mod tests {
             nat_addr: sample_addr(),
             nat_type: NatType::Other,
             hostname: "h".to_string(),
+            local_addrs: Vec::new(),
             peers: Vec::new(),
         };
         let bytes = info.to_bytes();
@@ -380,10 +449,70 @@ mod tests {
     }
 
     #[test]
+    fn try_from_rejects_invalid_local_addrs() {
+        let data = b"203.0.113.5:51820\r\n1\r\nhost\r\n\r\nnot-an-addr";
+        let err = HostInfo::try_from(data.as_slice()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn try_from_accepts_missing_networks_section() {
         let data = b"203.0.113.5:51820\r\n1\r\nhost";
         let parsed = HostInfo::try_from(data.as_slice()).unwrap();
         assert_eq!(parsed.hostname, "host");
+        assert!(parsed.local_addrs.is_empty());
         assert!(parsed.peers.is_empty());
+    }
+
+    #[test]
+    fn try_from_accepts_legacy_payload_without_local_addrs() {
+        // A legacy sender emits four segments with the peer list last; the
+        // upgraded parser must keep accepting it (local_addrs empty).
+        let data = b"203.0.113.5:51820\r\n1\r\nhost\r\n42,10.64.0.2,550e8400-e29b-41d4-a716-446655440000,1,203.0.113.5:51820";
+        let parsed = HostInfo::try_from(data.as_slice()).unwrap();
+        assert_eq!(parsed.peers.len(), 1);
+        assert_eq!(parsed.peers[0].peer_id, 42);
+        assert!(parsed.local_addrs.is_empty());
+    }
+
+    #[test]
+    fn host_info_roundtrips_local_addrs() {
+        let info = HostInfo {
+            nat_addr: sample_addr(),
+            nat_type: NatType::Other,
+            hostname: "h".to_string(),
+            local_addrs: vec![
+                "192.168.1.10:41641".parse().unwrap(),
+                "10.10.0.3:41641".parse().unwrap(),
+            ],
+            peers: Vec::new(),
+        };
+        let parsed = HostInfo::try_from(info.to_bytes().as_slice()).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn peer_info_roundtrips_local_addrs() {
+        let info = PeerInfo::new(42, IpAddr::V4(Ipv4Addr::new(10, 64, 0, 2)), SAMPLE_NET_A)
+            .unwrap()
+            .with_nat_addr(Some(sample_addr()))
+            .with_local_addrs(vec![
+                "192.168.1.10:41641".parse().unwrap(),
+                "10.10.0.3:41641".parse().unwrap(),
+            ]);
+        let wire = String::from(&info);
+        let parsed = PeerInfo::try_from(wire.as_str()).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn peer_info_parses_legacy_five_field_entry() {
+        // A sender that predates local-address reporting emits five fields;
+        // that must still parse, with no LAN candidates.
+        let entry = "42,10.64.0.2,550e8400-e29b-41d4-a716-446655440000,1,203.0.113.5:51820";
+        let parsed = PeerInfo::try_from(entry).unwrap();
+        assert_eq!(parsed.peer_id, 42);
+        assert_eq!(parsed.nat_addr, Some(sample_addr()));
+        assert!(parsed.local_addrs.is_empty());
     }
 }

@@ -291,10 +291,15 @@ impl ConnectionManager {
 
                             let udp = udp.clone();
                             let to_addr = addr.clone();
+                            // Stamp the host-level path candidates into the
+                            // broadcast entry: the STUN address and the LAN
+                            // addresses the host reported. Receivers open a
+                            // session per candidate and pick by RTT.
                             let info = peer_info
                                 .clone()
                                 .with_nat_type(info.nat_type)
-                                .with_nat_addr(Some(info.nat_addr));
+                                .with_nat_addr(Some(info.nat_addr))
+                                .with_local_addrs(info.local_addrs.clone());
                             let payload: Vec<u8> = (&info).into();
                             let target_peer = target_id.clone();
                             tokio::spawn(async move {
