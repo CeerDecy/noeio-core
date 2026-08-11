@@ -124,12 +124,12 @@ impl NoeioDaemon {
         if let Some(nat_addr) = peer.address() {
             let header = PacketHeader {
                 packet_type: NoeioPacketType::Delivery,
-                peer_id: peer.local_peer_id,
+                peer_id: peer.local_peer_id(),
                 port: 0,
             };
             let bytes: Vec<u8> = NoeioPacket::new(header, datagram).into();
             tracing::debug!(
-                peer_id = peer.info.peer_id,
+                peer_id = peer.info().peer_id,
                 %nat_addr,
                 "send_to_peer: direct path",
             );
@@ -146,12 +146,12 @@ impl NoeioDaemon {
 
         let header = PacketHeader {
             packet_type: NoeioPacketType::Forward,
-            peer_id: peer.info.peer_id,
+            peer_id: peer.info().peer_id,
             port: 0,
         };
         let bytes: Vec<u8> = NoeioPacket::new(header, datagram).into();
         tracing::debug!(
-            peer_id = peer.info.peer_id,
+            peer_id = peer.info().peer_id,
             derper = %derper.address,
             "send_to_peer: relay path",
         );
@@ -188,11 +188,11 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
                                 );
                                 continue;
                             }
-                            Some(peer) => peer.clone(),
+                            Some(peer) => peer,
                         };
 
                         let mut wg_buf = [0u8; WG_BUFFER_SIZE];
-                        match peer.codec.encapsulate(ip_bytes, &mut wg_buf) {
+                        match peer.codec().encapsulate(ip_bytes, &mut wg_buf) {
                             TunnOutput::ToPeer(datagram) => {
                                 if let Err(err) = state.send_to_peer(&peer, datagram).await {
                                     tracing::error!("Failed to send packet: {}", err);
@@ -200,7 +200,7 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
                             }
                             TunnOutput::Err(err) => {
                                 tracing::warn!(
-                                    peer_id = peer.info.peer_id,
+                                    peer_id = peer.info().peer_id,
                                     "encapsulate failed: {}",
                                     err
                                 );
@@ -359,11 +359,10 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                 let Some(payload) = packet.payload() else {
                                     continue;
                                 };
-                                // Clone the peer out so the router guard drops
-                                // before we await (same rule as
-                                // `dispatch_signalling`).
+                                // `get_by_peer_id` clones the `Arc` out, so no
+                                // router guard is held across the await below.
                                 let peer = match state.router.get_by_peer_id(&header.peer_id) {
-                                    Some(peer) => peer.clone(),
+                                    Some(peer) => peer,
                                     None => {
                                         tracing::warn!(
                                             source = %addr,
@@ -399,8 +398,8 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                             // this peer's network (SyncRoute is
                                             // addressed to us); the session stamps
                                             // it into the signalling it sends.
-                                            match state.router.get_mut(&peer.noeio_ip) {
-                                                Some(mut existing) => {
+                                            match state.router.get(&peer.noeio_ip) {
+                                                Some(existing) => {
                                                     existing.update_info(
                                                         peer.clone(),
                                                         header.peer_id,
@@ -512,24 +511,26 @@ async fn handle_delivery(
     payload: &[u8],
     src: SocketAddr,
 ) {
+    let info = peer.info();
+    let codec = peer.codec();
     let mut input: &[u8] = payload;
     loop {
         let mut buf = [0u8; WG_BUFFER_SIZE];
-        match peer.codec.decapsulate(Some(src.ip()), input, &mut buf) {
+        match codec.decapsulate(Some(src.ip()), input, &mut buf) {
             TunnOutput::ToNic(plaintext, inner_src) => {
                 // Anti-spoofing: the decrypted packet must claim the virtual
                 // IP of the peer whose session decrypted it.
                 if let Some(ip) = inner_src
-                    && ip != peer.info.noeio_ip
+                    && ip != info.noeio_ip
                 {
                     tracing::warn!(
-                        peer_id = peer.info.peer_id,
+                        peer_id = info.peer_id,
                         %ip,
                         "dropping packet: inner source doesn't match peer"
                     );
                     break;
                 }
-                write_to_nic(state, peer.local_peer_id, plaintext).await;
+                write_to_nic(state, peer.local_peer_id(), plaintext).await;
                 break;
             }
             TunnOutput::ToPeer(reply) => {
@@ -543,7 +544,7 @@ async fn handle_delivery(
             }
             TunnOutput::Consumed => break,
             TunnOutput::Err(err) => {
-                tracing::warn!(peer_id = peer.info.peer_id, "decapsulate failed: {}", err);
+                tracing::warn!(peer_id = info.peer_id, "decapsulate failed: {}", err);
                 break;
             }
         }
@@ -587,7 +588,7 @@ fn wg_timers(daemon: Arc<NoeioDaemon>) {
             // below.
             for peer in daemon.router.peers() {
                 let mut buf = [0u8; WG_BUFFER_SIZE];
-                match peer.codec.update_timers(&mut buf) {
+                match peer.codec().update_timers(&mut buf) {
                     TunnOutput::ToPeer(datagram) => {
                         if let Err(err) = daemon.send_to_peer(&peer, datagram).await {
                             tracing::error!("failed to send timer packet: {}", err);
@@ -596,7 +597,7 @@ fn wg_timers(daemon: Arc<NoeioDaemon>) {
                     // Idle tunnels report expiry here on every tick; that's
                     // state, not an event worth logging above trace.
                     TunnOutput::Err(err) => {
-                        tracing::trace!(peer_id = peer.info.peer_id, "update_timers: {}", err);
+                        tracing::trace!(peer_id = peer.info().peer_id, "update_timers: {}", err);
                     }
                     _ => {}
                 }
@@ -613,21 +614,15 @@ fn wg_timers(daemon: Arc<NoeioDaemon>) {
 /// actual handling (nonce-matched handshake, Ack/Pong replies, RTT and
 /// liveness stamps).
 ///
-/// The peer handle is cloned out and the `Router`'s DashMap guard dropped before
-/// awaiting: `inbound` awaits on the session channel, and holding a shard
-/// read-lock across that await could deadlock a concurrent `insert`/`get_mut` on
-/// the same shard.
+/// `get_by_peer_id` clones the `Arc` out, so no router shard guard is held
+/// across the `inbound` await.
 async fn dispatch_signalling(
     state: &Arc<NoeioDaemon>,
     header: &PacketHeader,
     datagram: &[u8],
     src: SocketAddr,
 ) {
-    let Some(peer) = state
-        .router
-        .get_by_peer_id(&header.peer_id)
-        .map(|peer| peer.clone())
-    else {
+    let Some(peer) = state.router.get_by_peer_id(&header.peer_id) else {
         tracing::warn!(
             peer_id = header.peer_id,
             "received signalling packet for unknown peer",
