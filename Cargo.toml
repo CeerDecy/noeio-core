@@ -1,5 +1,5 @@
 [workspace]
-members = ["noeio", "noeio-center", "noeio-common", "noeio-derp", "noeio-proto"]
+members = ["noeio", "noeio-common", "noeio-derp", "noeio-proto"]
 
 [workspace.dependencies]
 noeio-common = { path = "noeio-common" }
