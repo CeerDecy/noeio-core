@@ -293,13 +293,21 @@ impl ConnectionManager {
                             let to_addr = addr.clone();
                             // Stamp the host-level path candidates into the
                             // broadcast entry: the STUN address and the LAN
-                            // addresses the host reported. Receivers open a
-                            // session per candidate and pick by RTT.
+                            // addresses. Receivers open a session per
+                            // candidate and pick by RTT. LAN candidates come
+                            // from the peer entry itself; the host-level list
+                            // is a fallback for senders that predate per-peer
+                            // local_addrs (HostInfo.local_addrs is deprecated).
+                            let local_addrs = if peer_info.local_addrs.is_empty() {
+                                info.local_addrs.clone()
+                            } else {
+                                peer_info.local_addrs.clone()
+                            };
                             let info = peer_info
                                 .clone()
                                 .with_nat_type(info.nat_type)
                                 .with_nat_addr(Some(info.nat_addr))
-                                .with_local_addrs(info.local_addrs.clone());
+                                .with_local_addrs(local_addrs);
                             let payload: Vec<u8> = (&info).into();
                             let target_peer = target_id.clone();
                             tokio::spawn(async move {

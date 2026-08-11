@@ -4,7 +4,6 @@ pub mod peer;
 pub mod router;
 pub mod stun;
 
-use std::io::ErrorKind;
 use crate::common;
 use crate::config::Config;
 use crate::daemon::derper::DerperManager;
@@ -20,6 +19,7 @@ use noeio_common::host_info::{HostInfo, NatType, PeerId, PeerInfo};
 use noeio_common::packet::report::ReportPayload;
 use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader};
 use smoltcp::wire::Ipv4Packet;
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use stun_codec::rfc5389::Attribute;
@@ -128,7 +128,7 @@ impl NoeioDaemon {
                 port: 0,
             };
             let bytes: Vec<u8> = NoeioPacket::new(header, datagram).into();
-            tracing::debug!(
+            tracing::info!(
                 peer_id = peer.info().peer_id,
                 %nat_addr,
                 "send_to_peer: direct path",
@@ -139,7 +139,10 @@ impl NoeioDaemon {
         let derper = match self.derper.current().await {
             None => {
                 tracing::error!("DERPER: No server selected");
-                return Err(std::io::Error::new(ErrorKind::NotFound, "No server selected"));
+                return Err(std::io::Error::new(
+                    ErrorKind::NotFound,
+                    "No server selected",
+                ));
             }
             Some(derper) => derper,
         };
@@ -150,9 +153,10 @@ impl NoeioDaemon {
             port: 0,
         };
         let bytes: Vec<u8> = NoeioPacket::new(header, datagram).into();
-        tracing::debug!(
+        tracing::info!(
             peer_id = peer.info().peer_id,
             derper = %derper.address,
+            nat_addr = "none",
             "send_to_peer: relay path",
         );
         self.udp.send_to(&bytes, derper.address).await
@@ -235,7 +239,11 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
 /// traffic to an overlay address goes *through* the tunnel.
 fn report_local_addrs(port: u16, derper: SocketAddr, overlay_ips: &[IpAddr]) -> Vec<SocketAddr> {
     let primary = || -> Option<IpAddr> {
-        let bind_addr = if derper.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind_addr = if derper.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let probe = std::net::UdpSocket::bind(bind_addr).ok()?;
         probe.connect(derper).ok()?;
         Some(probe.local_addr().ok()?.ip())
@@ -279,11 +287,16 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
 
             // Refresh the LAN candidate on every report: the primary route
             // can change, and the report is what keeps the derper's view
-            // current.
+            // current. The candidate lives on each PeerInfo (the per-network
+            // identity the derper broadcasts); the host-level copy is only
+            // kept for derpers that predate per-peer local_addrs.
             match daemon.udp.local_addr() {
                 Ok(local) => {
-                    host_info.local_addrs =
-                        report_local_addrs(local.port(), addr, &daemon.nics.ips());
+                    let local_addrs = report_local_addrs(local.port(), addr, &daemon.nics.ips());
+                    for peer in &mut host_info.peers {
+                        peer.local_addrs = local_addrs.clone();
+                    }
+                    host_info.local_addrs = local_addrs;
                 }
                 Err(err) => {
                     tracing::warn!("report: failed to read local udp port: {}", err);
@@ -441,10 +454,8 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                             // it into the signalling it sends.
                                             match state.router.get(&peer.noeio_ip) {
                                                 Some(existing) => {
-                                                    existing.update_info(
-                                                        peer.clone(),
-                                                        header.peer_id,
-                                                    );
+                                                    existing
+                                                        .update_info(peer.clone(), header.peer_id);
                                                 }
                                                 None => {
                                                     state.router.insert(Peer::new(
@@ -546,12 +557,7 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
 /// the codec produces: plaintext goes to the nic we registered in this peer's
 /// network, protocol replies (handshake responses, keepalives, queued data
 /// packets) go back to the peer.
-async fn handle_delivery(
-    state: &Arc<NoeioDaemon>,
-    peer: &Peer,
-    payload: &[u8],
-    src: SocketAddr,
-) {
+async fn handle_delivery(state: &Arc<NoeioDaemon>, peer: &Peer, payload: &[u8], src: SocketAddr) {
     let info = peer.info();
     let codec = peer.codec();
     let mut input: &[u8] = payload;

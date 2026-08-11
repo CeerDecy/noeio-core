@@ -209,9 +209,10 @@ pub struct HostInfo {
     pub nat_addr: SocketAddr,
     pub nat_type: NatType,
     pub hostname: String,
-    /// Addresses of this host's physical NICs paired with its UDP port (LAN
-    /// paths). Host-level like `nat_addr`: the derper stamps them into every
-    /// `PeerInfo` it broadcasts about this host.
+    /// Deprecated: LAN candidates now travel on each [`PeerInfo`]
+    /// (`PeerInfo::local_addrs`), the per-network identity the derper
+    /// actually broadcasts. This host-level copy is still written so older
+    /// derpers keep working; remove it together with their fallback path.
     pub local_addrs: Vec<SocketAddr>,
     pub peers: Vec<PeerInfo>,
 }

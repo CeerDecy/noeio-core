@@ -56,7 +56,7 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    Docker 方式：
 
    ```bash
-   docker run -d --name noeio-derper -p 8080:8080/udp --rm registry.cn-hangzhou.aliyuncs.com/noeio/noeio-derp:202608111410-bd5e900
+   docker run -d --name noeio-derper -p 8080:8080/udp --rm registry.cn-hangzhou.aliyuncs.com/noeio/noeio-derp:202608112151-7b767cd
    ```
 
    或二进制方式：
