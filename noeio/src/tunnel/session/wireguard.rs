@@ -50,7 +50,7 @@ impl TunnelSession for WireGuardTunnelSession {
         // stats().0 is the time since the last completed handshake.
         match tunn.stats().0 {
             Some(_) => SessionState::Connected,
-            None if tunn.is_expired() => SessionState::Failed,
+            None if tunn.is_expired() => SessionState::Timeout,
             None => SessionState::Connecting,
         }
     }

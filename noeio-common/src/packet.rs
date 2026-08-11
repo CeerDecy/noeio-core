@@ -16,7 +16,8 @@ pub enum NoeioPacketType {
     Report,         // report host info
     Seq,            // UDP hole punch request (initiator)
     Ack,            // UDP hole punch response (acknowledgement)
-    KeepAlive,      // periodic packet to keep the NAT mapping open
+    TunnelPing,     // periodic liveness probe; keeps the NAT mapping open and carries the sender's send timestamp
+    TunnelPong,     // reply to TunnelPing echoing its timestamp, so the pinger can compute the tunnel RTT
     Delivery,       // data packet from the peer named in the header; process locally, never forward
 }
 
@@ -260,8 +261,9 @@ impl TryFrom<u8> for NoeioPacketType {
             3 => Ok(NoeioPacketType::Report),
             4 => Ok(NoeioPacketType::Seq),
             5 => Ok(NoeioPacketType::Ack),
-            6 => Ok(NoeioPacketType::KeepAlive),
+            6 => Ok(NoeioPacketType::TunnelPing),
             7 => Ok(NoeioPacketType::Delivery),
+            8 => Ok(NoeioPacketType::TunnelPong),
             _ => Err(value),
         }
     }
@@ -276,8 +278,9 @@ impl From<NoeioPacketType> for u8 {
             NoeioPacketType::Report => 3,
             NoeioPacketType::Seq => 4,
             NoeioPacketType::Ack => 5,
-            NoeioPacketType::KeepAlive => 6,
+            NoeioPacketType::TunnelPing => 6,
             NoeioPacketType::Delivery => 7,
+            NoeioPacketType::TunnelPong => 8,
         }
     }
 }
@@ -317,7 +320,8 @@ mod delivery_tests {
             NoeioPacketType::Report,
             NoeioPacketType::Seq,
             NoeioPacketType::Ack,
-            NoeioPacketType::KeepAlive,
+            NoeioPacketType::TunnelPing,
+            NoeioPacketType::TunnelPong,
             NoeioPacketType::Delivery,
         ] {
             assert_eq!(NoeioPacketType::try_from(u8::from(packet_type)), Ok(packet_type));

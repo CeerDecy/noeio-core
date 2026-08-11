@@ -14,8 +14,8 @@ use super::{Datagram, SessionState, TunnelSession};
 /// Buffer size for the per-session inbound datagram channel.
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Length of the handshake nonce carried in a Seq/Ack payload (a big-endian
-/// `u64`).
+/// Length of the `u64` control payload — the handshake nonce in Seq/Ack, the
+/// ping timestamp in TunnelPing/TunnelPong — carried big-endian.
 const NONCE_LEN: usize = 8;
 
 /// How long `handshake` waits for an Ack before retransmitting the Seq.
@@ -24,24 +24,27 @@ const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// How many Seq packets `handshake` sends before giving up.
 const HANDSHAKE_MAX_ATTEMPTS: usize = 5;
 
-/// How often `keepalive` sends a KeepAlive packet to hold the NAT mapping open.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// How often `ping` sends a TunnelPing packet. Each ping both holds the NAT
+/// mapping open (the old KeepAlive's job) and samples the tunnel RTT via the
+/// TunnelPong echo.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How long the peer may go silent (no inbound datagram of any kind) before
-/// `monitor` declares the session dead. Set to a few keepalive intervals so
-/// a couple of dropped keepalives don't trip it.
+/// `monitor` declares the session dead. Set to a few ping intervals so a
+/// couple of dropped pings don't trip it.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How often `monitor` checks the elapsed time since the last inbound datagram.
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Build a Seq/Ack/KeepAlive control packet carrying `nonce` in its payload.
+/// Build a signalling control packet (Seq/Ack/TunnelPing/TunnelPong) carrying
+/// `value` — a handshake nonce or a ping timestamp — in its payload.
 ///
 /// `peer_id` is *our own* id (the sender's), not the target's. Signalling
 /// packets carry the sender's id so the receiver can resolve us in its router
 /// via `get_by_peer_id` — the opposite of Forward, which carries the receiver's
 /// id because the receiver routes it against its local nic table.
-fn control_packet(packet_type: NoeioPacketType, peer_id: PeerId, nonce: u64) -> NoeioPacket {
+fn control_packet(packet_type: NoeioPacketType, peer_id: PeerId, value: u64) -> NoeioPacket {
     NoeioPacket::new(
         PacketHeader {
             packet_type,
@@ -50,36 +53,45 @@ fn control_packet(packet_type: NoeioPacketType, peer_id: PeerId, nonce: u64) -> 
             peer_id,
             ..PacketHeader::default()
         },
-        &nonce.to_be_bytes(),
+        &value.to_be_bytes(),
     )
 }
 
-/// Read the handshake nonce from a control packet's payload, if present.
-fn nonce_of(packet: &NoeioPacket) -> Option<u64> {
+/// Read the `u64` value (handshake nonce or ping timestamp) from a control
+/// packet's payload, if present.
+fn payload_u64(packet: &NoeioPacket) -> Option<u64> {
     let bytes = packet.payload()?.get(..NONCE_LEN)?;
     Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
 /// A [`TunnelSession`] backed by a plain UDP socket.
 ///
-/// It performs the Seq/Ack hole-punch handshake, keeps the NAT mapping alive,
-/// and tracks liveness — but carries no business traffic. Data packets travel
-/// on the outer UDP socket directly; this session only owns signalling.
+/// It performs the Seq/Ack hole-punch handshake, keeps the NAT mapping alive
+/// with a TunnelPing/TunnelPong exchange that doubles as an RTT probe, and
+/// tracks liveness — but carries no business traffic. Data packets travel on
+/// the outer UDP socket directly; this session only owns signalling.
 ///
 /// The socket is read globally elsewhere; datagrams destined for this session
-/// (its control packets and keepalives) are routed in through a channel and
-/// handled by a background `dispatch` task rather than read from the socket
-/// directly.
+/// (its control packets and pings) are routed in through a channel and handled
+/// by a background `dispatch` task rather than read from the socket directly.
 pub struct UdpTunnelSession {
     /// Handshake/liveness state. A lock-free `AtomicU8` holding a
     /// [`SessionState`]: written by the `handshake`/`monitor` tasks, read
     /// through `&self`, with no mutex.
     state: Arc<AtomicU8>,
+    /// Latest round-trip time in milliseconds, measured by the ping/pong
+    /// exchange. Written by `dispatch` whenever a matching TunnelPong arrives;
+    /// `u64::MAX` until the first sample.
+    rtt_ms: Arc<AtomicU64>,
     /// Background tasks owned by this session (`send`, `dispatch`, `handshake`,
     /// `monitor`). Dropping the session aborts them, so the tasks—and the
     /// socket the `send` task holds—don't leak.
     _tasks: JoinSet<()>,
 }
+
+/// Sentinel for "no RTT sample yet" / "no ping in flight" in the shared
+/// atomics.
+const U64_UNSET: u64 = u64::MAX;
 
 impl UdpTunnelSession {
     /// Open a session over `socket` toward peer `target`, spawning the
@@ -88,8 +100,9 @@ impl UdpTunnelSession {
     /// uses to route this peer's inbound signalling datagrams into it.
     ///
     /// `peer_id` is *our own* id in the target's network, not the target's id.
-    /// It's stamped into the header of every Seq/Ack/KeepAlive we emit so the
-    /// receiver can resolve us (the sender) in its router. See `control_packet`.
+    /// It's stamped into the header of every Seq/Ack/TunnelPing/TunnelPong we
+    /// emit so the receiver can resolve us (the sender) in its router. See
+    /// `control_packet`.
     pub fn connect(
         socket: Arc<UdpSocket>,
         target: SocketAddr,
@@ -108,6 +121,11 @@ impl UdpTunnelSession {
         // millisecond offset from a shared base instead.
         let base = Instant::now();
         let last_recv = Arc::new(AtomicU64::new(0));
+        // Timestamp (millis since `base`) of the last TunnelPing we sent.
+        // Written by `ping`, matched by `dispatch` against the TunnelPong echo
+        // so a stray or stale pong can't produce a bogus RTT sample.
+        let last_ping = Arc::new(AtomicU64::new(U64_UNSET));
+        let rtt_ms = Arc::new(AtomicU64::new(U64_UNSET));
         // Nonce tying our Seq to the Ack we expect back, so a stray or replayed
         // Ack (carrying a different nonce) can't complete the handshake.
         let nonce = rand::random::<u64>();
@@ -124,12 +142,23 @@ impl UdpTunnelSession {
             nonce,
             base,
             last_recv.clone(),
+            last_ping.clone(),
+            rtt_ms.clone(),
         ));
-        tasks.spawn(Self::handshake(out_tx, ack_rx, state.clone(), peer_id, nonce));
+        tasks.spawn(Self::handshake(
+            out_tx,
+            ack_rx,
+            state.clone(),
+            peer_id,
+            nonce,
+            base,
+            last_ping,
+        ));
         tasks.spawn(Self::monitor(state.clone(), base, last_recv));
 
         let session = Self {
             state,
+            rtt_ms,
             _tasks: tasks,
         };
         (session, tx)
@@ -160,14 +189,17 @@ impl UdpTunnelSession {
     ///   a different or missing nonce is dropped.
     /// - `Seq` (an incoming hole-punch request) is answered with an `Ack` that
     ///   echoes the Seq's nonce, pushed onto `out_tx`.
-    /// - `KeepAlive` and anything else is dropped (the liveness stamp above is
-    ///   the only effect keepalives have).
+    /// - `TunnelPing` is answered with a `TunnelPong` echoing its timestamp
+    ///   (only the fixed 8-byte value, never an arbitrary payload).
+    /// - `TunnelPong` yields an RTT sample when its echo matches the timestamp
+    ///   of the last ping we sent (`last_ping`); anything else is dropped.
     ///
     /// TODO: the Ack now goes to the fixed `target` (via the send task) rather
     /// than the Seq's actual source address. For strict hole punching the reply
     /// may need to target the observed source; revisit if that matters.
     ///
     /// Runs as a background task until the inbound channel closes.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch(
         mut recv: mpsc::Receiver<Datagram>,
         out_tx: mpsc::Sender<Vec<u8>>,
@@ -176,6 +208,8 @@ impl UdpTunnelSession {
         nonce: u64,
         base: Instant,
         last_recv: Arc<AtomicU64>,
+        last_ping: Arc<AtomicU64>,
+        rtt_ms: Arc<AtomicU64>,
     ) {
         while let Some(datagram) = recv.recv().await {
             // Any inbound datagram proves the peer is alive; stamp the liveness
@@ -189,7 +223,7 @@ impl UdpTunnelSession {
                 NoeioPacketType::Ack => {
                     // Only our own nonce coming back counts; anything else is a
                     // stray/replayed Ack and is ignored.
-                    if nonce_of(&packet) == Some(nonce) {
+                    if payload_u64(&packet) == Some(nonce) {
                         // A pending signal already means "Ack seen"; ignore if full.
                         let _ = ack_tx.try_send(());
                     }
@@ -198,7 +232,7 @@ impl UdpTunnelSession {
                     // Peer initiated a hole punch — answer with an Ack that
                     // echoes their nonce so they can correlate it. A Seq without
                     // a nonce is malformed; drop it.
-                    match nonce_of(&packet) {
+                    match payload_u64(&packet) {
                         Some(peer_nonce) => {
                             let ack = control_packet(NoeioPacketType::Ack, peer_id, peer_nonce);
                             let _ = out_tx.send(ack.inner.to_vec()).await;
@@ -208,8 +242,33 @@ impl UdpTunnelSession {
                         }
                     }
                 }
-                // KeepAlive (liveness already stamped) and any other packet type
-                // carry nothing this session acts on.
+                NoeioPacketType::TunnelPing => {
+                    // Echo the peer's timestamp back so it can compute its RTT.
+                    // The value is opaque to us (it's on the peer's clock); a
+                    // ping without one is malformed and dropped.
+                    match payload_u64(&packet) {
+                        Some(peer_ts) => {
+                            let pong =
+                                control_packet(NoeioPacketType::TunnelPong, peer_id, peer_ts);
+                            let _ = out_tx.send(pong.inner.to_vec()).await;
+                        }
+                        None => {
+                            tracing::debug!(src = %datagram.1, "dropping malformed TunnelPing with no timestamp");
+                        }
+                    }
+                }
+                NoeioPacketType::TunnelPong => {
+                    // An RTT sample counts only if the echo matches the last
+                    // ping we sent — same correlation rule as the Ack nonce —
+                    // so a stale, duplicated, or forged pong is ignored.
+                    let sent = last_ping.load(Ordering::Acquire);
+                    if sent != U64_UNSET && payload_u64(&packet) == Some(sent) {
+                        let now = base.elapsed().as_millis() as u64;
+                        rtt_ms.store(now.saturating_sub(sent), Ordering::Release);
+                    }
+                }
+                // Anything else (liveness already stamped) carries nothing this
+                // session acts on.
                 _ => {}
             }
         }
@@ -217,7 +276,7 @@ impl UdpTunnelSession {
 
     /// Perform the hole-punch handshake as a background task: send a Seq packet
     /// and wait for the peer's Ack (surfaced by `dispatch` through `ack_rx`),
-    /// then mark the session connected and hand off to keepalive.
+    /// then mark the session connected and hand off to the ping loop.
     ///
     /// Runs in the session's `JoinSet`, so it owns everything it touches rather
     /// than borrowing `self`; `state` is shared back via `Arc`.
@@ -228,13 +287,15 @@ impl UdpTunnelSession {
     /// The Seq is retransmitted up to [`HANDSHAKE_MAX_ATTEMPTS`] times, waiting
     /// [`HANDSHAKE_RETRY_INTERVAL`] for an Ack between attempts (UDP may drop the
     /// Seq or its Ack). On success `state` becomes [`SessionState::Connected`];
-    /// if every attempt times out it becomes [`SessionState::Failed`].
+    /// if every attempt times out it becomes [`SessionState::Timeout`].
     async fn handshake(
         out_tx: mpsc::Sender<Vec<u8>>,
         mut ack_rx: mpsc::Receiver<()>,
         state: Arc<AtomicU8>,
         peer_id: PeerId,
         nonce: u64,
+        base: Instant,
+        last_ping: Arc<AtomicU64>,
     ) {
         let seq = control_packet(NoeioPacketType::Seq, peer_id, nonce);
 
@@ -247,12 +308,12 @@ impl UdpTunnelSession {
             // Wait for dispatch to signal a matching Ack. On timeout, loop and
             // retransmit; the same nonce is reused so a late Ack still counts.
             match tokio::time::timeout(HANDSHAKE_RETRY_INTERVAL, ack_rx.recv()).await {
-                // Ack arrived — the session is up. Hand off to keepalive, which
-                // runs for the rest of this task's life.
+                // Ack arrived — the session is up. Hand off to the ping loop,
+                // which runs for the rest of this task's life.
                 Ok(Some(())) => {
                     tracing::debug!(nonce, "udp handshake complete");
                     state.store(SessionState::Connected as u8, Ordering::Release);
-                    Self::keepalive(out_tx, peer_id).await;
+                    Self::ping(out_tx, peer_id, base, last_ping).await;
                     return;
                 }
                 // Channel closed — dispatch dropped its sender, so no Ack will
@@ -262,8 +323,8 @@ impl UdpTunnelSession {
                 Err(_) => continue,
             }
         }
-        // Exhausted all attempts without an Ack; mark the handshake failed.
-        state.store(SessionState::Failed as u8, Ordering::Release);
+        // Exhausted all attempts without an Ack; mark the handshake timed out.
+        state.store(SessionState::Timeout as u8, Ordering::Release);
         tracing::warn!(
             nonce,
             attempts = HANDSHAKE_MAX_ATTEMPTS,
@@ -271,23 +332,27 @@ impl UdpTunnelSession {
         );
     }
 
-    /// Periodically send a KeepAlive packet to hold the NAT mapping open.
+    /// Periodically send a TunnelPing packet. It plays the old KeepAlive's role
+    /// (holding the NAT mapping open and stamping the peer's liveness clock)
+    /// and additionally carries our send timestamp, which the peer echoes back
+    /// in a TunnelPong so `dispatch` can compute the tunnel RTT.
     ///
     /// Started by `handshake` once the session is up; runs until the send task
     /// is gone (its channel closed), i.e. the session is shutting down.
-    async fn keepalive(out_tx: mpsc::Sender<Vec<u8>>, peer_id: PeerId) {
-        let packet = NoeioPacket::new(
-            PacketHeader {
-                packet_type: NoeioPacketType::KeepAlive,
-                // Sender's own id, same as Seq/Ack: the receiver resolves us in
-                // its router by this. See `control_packet`.
-                peer_id,
-                ..PacketHeader::default()
-            },
-            &[],
-        );
+    async fn ping(
+        out_tx: mpsc::Sender<Vec<u8>>,
+        peer_id: PeerId,
+        base: Instant,
+        last_ping: Arc<AtomicU64>,
+    ) {
         loop {
-            tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+            tokio::time::sleep(PING_INTERVAL).await;
+            // Millis since `base`, the same clock `dispatch` reads to compute
+            // the RTT when the echo comes back. Publish it before sending so
+            // the pong can't race the store.
+            let now = base.elapsed().as_millis() as u64;
+            last_ping.store(now, Ordering::Release);
+            let packet = control_packet(NoeioPacketType::TunnelPing, peer_id, now);
             if out_tx.send(packet.inner.to_vec()).await.is_err() {
                 // Send task gone — session is closing.
                 break;
@@ -296,12 +361,12 @@ impl UdpTunnelSession {
     }
 
     /// Passively watch for a dead peer: if no inbound datagram has arrived within
-    /// [`LIVENESS_TIMEOUT`], flip `state` to [`SessionState::Failed`].
+    /// [`LIVENESS_TIMEOUT`], flip `state` to [`SessionState::Timeout`].
     ///
-    /// Both peers send keepalives, so a healthy link stamps `last_recv` at least
-    /// once per [`KEEPALIVE_INTERVAL`]; silence past the timeout means the peer
-    /// is gone. Only a `Connected` session is demoted — `Connecting` is the
-    /// handshake's business, and `Failed` is terminal.
+    /// Both peers send pings (and answer them with pongs), so a healthy link
+    /// stamps `last_recv` at least once per [`PING_INTERVAL`]; silence past the
+    /// timeout means the peer is gone. Only a `Connected` session is demoted —
+    /// `Connecting` is the handshake's business, and `Timeout` is terminal.
     async fn monitor(state: Arc<AtomicU8>, base: Instant, last_recv: Arc<AtomicU64>) {
         loop {
             tokio::time::sleep(LIVENESS_CHECK_INTERVAL).await;
@@ -314,7 +379,7 @@ impl UdpTunnelSession {
             let last = Duration::from_millis(last_recv.load(Ordering::Acquire));
             let silent = base.elapsed().saturating_sub(last);
             if silent >= LIVENESS_TIMEOUT {
-                state.store(SessionState::Failed as u8, Ordering::Release);
+                state.store(SessionState::Timeout as u8, Ordering::Release);
                 tracing::warn!(
                     silent_ms = silent.as_millis() as u64,
                     "udp session timed out: no inbound datagram within liveness window"
@@ -327,8 +392,17 @@ impl UdpTunnelSession {
 impl TunnelSession for UdpTunnelSession {
     fn state(&self) -> SessionState {
         // Written by the `handshake` and `monitor` tasks; `Connecting` until the
-        // peer's Ack arrives, then `Connected`, or `Failed` on handshake
-        // exhaustion or liveness timeout.
+        // peer's Ack arrives, then `Connected`, or `Timeout` on handshake
+        // exhaustion or liveness silence.
         SessionState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        // Written by `dispatch` on every TunnelPong whose echo matches the last
+        // ping sent; unset until the first sample arrives.
+        match self.rtt_ms.load(Ordering::Acquire) {
+            U64_UNSET => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
     }
 }

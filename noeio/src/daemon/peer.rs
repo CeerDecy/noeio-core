@@ -16,18 +16,18 @@ pub struct Peer {
     /// Broadcast identity (peer_id / virtual IP / network).
     pub info: PeerInfo,
     /// Our own id in this peer's network, learned from the `SyncRoute` header.
-    /// Stamped into the Seq/Ack/KeepAlive packets this peer's session emits so
-    /// the remote can resolve *us* (the sender) in its router — signalling
+    /// Stamped into the Seq/Ack/TunnelPing/TunnelPong packets this peer's
+    /// session emits so the remote can resolve *us* (the sender) in its router — signalling
     /// packets carry the sender's id, unlike Forward which carries the
     /// receiver's. A `u32`, so stored by value: a `&PeerId` would be larger and
     /// would force a lifetime on `Peer`, which the owning `Router` can't satisfy.
     pub local_peer_id: PeerId,
     /// Shared outer UDP socket, used to open a direct tunnel session to this
-    /// peer on demand (e.g. after a `Failed` session needs re-establishing).
+    /// peer on demand (e.g. after a `Timeout` session needs re-establishing).
     pub socket: Arc<UdpSocket>,
     /// Direct tunnel session to this peer, if one has been established. The
-    /// session only maintains reachability (hole punch + keepalive); business
-    /// traffic goes over the outer UDP socket, not through it.
+    /// session only maintains reachability (hole punch + ping/pong liveness);
+    /// business traffic goes over the outer UDP socket, not through it.
     pub session: Option<Arc<Box<dyn TunnelSession>>>,
     /// Inbound side of the session: the global reader pushes this peer's
     /// signalling datagrams onto this sender, and the session's `dispatch` task
@@ -55,8 +55,8 @@ impl Peer {
     /// eagerly open a [`UdpTunnelSession`] to it; symmetric-NAT peers can only
     /// be reached via the relay and start with no direct session.
     /// `local_peer_id` is our own id in this peer's network (learned from the
-    /// `SyncRoute` header). It is stamped into the Seq/Ack/KeepAlive packets the
-    /// session emits so the remote can resolve *us* in its router — signalling
+    /// `SyncRoute` header). It is stamped into the Seq/Ack/TunnelPing/TunnelPong
+    /// packets the session emits so the remote can resolve *us* in its router — signalling
     /// packets carry the sender's id, unlike Forward which carries the
     /// receiver's.
     pub fn new(info: PeerInfo, socket: Arc<UdpSocket>, local_peer_id: PeerId) -> Self {
@@ -95,7 +95,7 @@ impl Peer {
         if !force {
             let needs_session = match &self.session {
                 None => true,
-                Some(session) => session.state() == SessionState::Failed,
+                Some(session) => session.state() == SessionState::Timeout,
             };
             if !needs_session {
                 return;

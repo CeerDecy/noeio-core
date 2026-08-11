@@ -437,14 +437,17 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                 }
                             }
                             NoeioPacketType::Report => {}
-                            // Seq/Ack/KeepAlive are a session's signalling traffic.
-                            // The peer's `UdpTunnelSession::dispatch` task owns the
-                            // handling (nonce-matched handshake, Ack reply, liveness
-                            // stamp); here we only resolve the peer by `peer_id` and
-                            // hand the raw datagram to its session's inbound channel.
+                            // Seq/Ack/TunnelPing/TunnelPong are a session's
+                            // signalling traffic. The peer's
+                            // `UdpTunnelSession::dispatch` task owns the handling
+                            // (nonce-matched handshake, Ack/Pong replies, RTT and
+                            // liveness stamps); here we only resolve the peer by
+                            // `peer_id` and hand the raw datagram to its session's
+                            // inbound channel.
                             NoeioPacketType::Seq
                             | NoeioPacketType::Ack
-                            | NoeioPacketType::KeepAlive => {
+                            | NoeioPacketType::TunnelPing
+                            | NoeioPacketType::TunnelPong => {
                                 dispatch_signalling(&state, &header, &buf[..n], addr).await;
                             }
                         }
@@ -602,12 +605,13 @@ fn wg_timers(daemon: Arc<NoeioDaemon>) {
     });
 }
 
-/// Route a session's signalling datagram (Seq/Ack/KeepAlive) to the peer it
-/// names.
+/// Route a session's signalling datagram (Seq/Ack/TunnelPing/TunnelPong) to
+/// the peer it names.
 ///
 /// Resolves the peer by `header.peer_id` and hands the raw datagram to its
 /// `UdpTunnelSession` inbound channel; the session's `dispatch` task owns the
-/// actual handling (nonce-matched handshake, Ack reply, liveness stamp).
+/// actual handling (nonce-matched handshake, Ack/Pong replies, RTT and
+/// liveness stamps).
 ///
 /// The peer handle is cloned out and the `Router`'s DashMap guard dropped before
 /// awaiting: `inbound` awaits on the session channel, and holding a shard

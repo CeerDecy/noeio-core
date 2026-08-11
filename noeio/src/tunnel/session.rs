@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 mod udp;
 mod wireguard;
@@ -16,8 +17,8 @@ pub type Datagram = (Vec<u8>, SocketAddr);
 /// Handshake/liveness state of a [`TunnelSession`].
 ///
 /// A session performing a hole punch starts as `Connecting`, becomes
-/// `Connected` once the peer confirms, or `Failed` if the handshake gives up or
-/// an established session later goes silent.
+/// `Connected` once the peer confirms, or `Timeout` if the handshake gives up
+/// or an established session later goes silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SessionState {
@@ -25,8 +26,9 @@ pub enum SessionState {
     Connecting = 0,
     /// The tunnel is up.
     Connected = 1,
-    /// The handshake gave up, or an established session timed out.
-    Failed = 2,
+    /// The handshake exhausted its retries, or an established session went
+    /// silent past the liveness window.
+    Timeout = 2,
 }
 
 impl SessionState {
@@ -35,7 +37,7 @@ impl SessionState {
     pub fn from_u8(value: u8) -> Self {
         match value {
             1 => Self::Connected,
-            2 => Self::Failed,
+            2 => Self::Timeout,
             _ => Self::Connecting,
         }
     }
@@ -74,6 +76,13 @@ pub enum TunnOutput<'a> {
 pub trait TunnelSession: Send + Sync {
     /// Current handshake/liveness state of the session.
     fn state(&self) -> SessionState;
+
+    /// Latest measured round-trip time to the peer, if the session probes it
+    /// (e.g. [`UdpTunnelSession`]'s TunnelPing/TunnelPong exchange). `None`
+    /// when no sample exists yet or the session doesn't measure RTT.
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
 
     /// Transform one inbound datagram received from the peer.
     ///

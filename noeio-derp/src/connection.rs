@@ -173,8 +173,9 @@ impl ConnectionManager {
                     }
                     NoeioPacketType::Seq
                     | NoeioPacketType::Ack
-                    | NoeioPacketType::KeepAlive => {
-                        // Hole-punch and keepalive signalling is peer-to-peer;
+                    | NoeioPacketType::TunnelPing
+                    | NoeioPacketType::TunnelPong => {
+                        // Hole-punch and ping/pong signalling is peer-to-peer;
                         // the relay does not act on it.
                     }
                     NoeioPacketType::Report => {
