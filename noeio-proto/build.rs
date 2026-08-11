@@ -36,6 +36,18 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    // Use the vendored protoc so builds (including `cargo install` on user
+    // machines) never depend on a system protoc — distro packages are often
+    // too old for proto3 optional fields (needs >= 3.15).
+    // SAFETY: build scripts run single-threaded at this point.
+    unsafe {
+        env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
+        env::set_var(
+            "PROTOC_INCLUDE",
+            protoc_bin_vendored::include_path().unwrap(),
+        );
+    }
+
     tonic_prost_build::configure()
         .file_descriptor_set_path(out_dir.join("descriptor.bin"))
         .compile_protos(&proto_files, &[proto_dir])
