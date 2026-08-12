@@ -28,9 +28,16 @@ impl VirtualNic {
         let tun_name = device.tun_name().unwrap();
 
         // set host ip
-        run_command(format!("ifconfig {} {:?}/{} {:?} up", tun_name, ip, "32", ip).as_str())
-            .await
-            .unwrap();
+        #[cfg(unix)]
+        let cmd = format!("ifconfig {} {:?}/{} {:?} up", tun_name, ip, "32", ip);
+        // Windows has no ifconfig; wintun adapters are configured via netsh.
+        // A /32 host mask matches the point-to-point setup used on Unix.
+        #[cfg(windows)]
+        let cmd = format!(
+            "netsh interface ipv4 set address name=\"{}\" source=static address={} mask=255.255.255.255",
+            tun_name, ip
+        );
+        run_command(&cmd).await.unwrap();
 
         let (tun_writer, tun_reader) = device.split().unwrap();
 
