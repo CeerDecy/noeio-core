@@ -17,11 +17,13 @@ Noeio is a self-hostable layer-3 mesh networking system. It connects machines ac
 
 ## Motivation
 
-It was after using [Tailscale](https://github.com/tailscale/tailscale) that I discovered how powerful and remarkably easy to use it is. Out of a desire to learn, I dug into the principles behind its implementation, and found they happened to resemble the Kubernetes CNI plugins I was studying at the time. So, to learn more and round out my networking knowledge, I decided to write an overlay network of my own. I know this project may never rival Tailscale, but the learning process alone has been richly rewarding. I hope to share it as the outcome of that learning, to exchange and discuss more knowledge and interesting ideas with the community.
+It was after using [Tailscale](https://github.com/tailscale/tailscale) that I discovered how powerful and remarkably easy to use it is. Out of a desire to learn, I dug into the principles behind its implementation, and found they happened to resemble the Kubernetes CNI plugins I was studying at the time. So, to learn more and round out my networking knowledge, I decided to write an overlay network of my own. I know this project may never rival Tailscale, but the learning process alone has been richly rewarding. I hope to share it as the outcome of that learning, to exchange and discuss more knowledge and interesting ideas with the community. Noeio is also inspired by sandbox-style products: their short-lived nature led me to design Noeio's nodes as stateless, so they fit naturally into a sandbox's lifecycle.
 
 ## Differences from Tailscale
 
 Noeio is a pure data-plane component: it only handles networking itself, and ships none of the account, identity, or ACL machinery that Tailscale builds in. This makes it well suited for self-hosted deployment. If you need multi-tenancy, pair it with your own control plane on top.
+
+In addition, Noeio nodes are stateless and non-persistently registered by nature (Tailscale nodes are stateful and persistently registered unless ephemeral mode is enabled). This keeps Noeio nodes extremely lightweight — they can be deployed and released at any time, which makes Noeio a great fit for sandbox use cases.
 
 ## Architecture
 
