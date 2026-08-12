@@ -1,0 +1,98 @@
+name: Bug Report
+description: Report a problem with noeio or the derper
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the project is affected?
+      options:
+        - noeio (node daemon)
+        - noeio-derp (relay server)
+        - Both / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `noeio --version` / `noeio-derp --version`, or the Docker image tag.
+      placeholder: "e.g. noeio-derp:202608112151-7b767cd"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      multiple: true
+      options:
+        - Linux
+        - macOS
+        - Windows
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - cargo install / built from source
+        - Docker image
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Step-by-step instructions to reproduce the problem.
+      placeholder: |
+        1. Started derper on a cloud instance ...
+        2. Joined two nodes with `noeio create vnic ...`
+        3. Ping from node A to node B ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: nat-type
+    attributes:
+      label: NAT type
+      description: The NAT type of the affected node(s) — you can check it at https://www.checkmynat.com/. Select all that apply if nodes differ.
+      multiple: true
+      options:
+        - No NAT / public IP
+        - Full Cone (NAT1)
+        - Restricted Cone (NAT2)
+        - Port Restricted Cone (NAT3)
+        - Symmetric (NAT4)
+        - Unknown
+
+  - type: textarea
+    id: network
+    attributes:
+      label: Network environment
+      description: Anything about the path between nodes that could matter — same LAN or across NATs, NAT type if known, proxy/TUN software (e.g. Clash) running on the host, direct or relay path in the logs.
+      placeholder: "e.g. two Macs on the same Wi-Fi, derper on a public cloud IP, Clash TUN enabled on one node"
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (optional)
+      description: |
+        Your `~/.noeio/config.toml` or derper config, if relevant.
+        **Redact the `token` value before posting.**
+      render: toml

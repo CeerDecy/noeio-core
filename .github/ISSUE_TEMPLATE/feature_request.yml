@@ -1,0 +1,21 @@
+name: Feature Request
+description: Suggest an idea or improvement
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do that noeio doesn't support today?
+      placeholder: "e.g. I want nodes to stay silent when idle and wake up on first packet ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like it to work? Rough ideas are welcome.
+    validations:
+      required: true
