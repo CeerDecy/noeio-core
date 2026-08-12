@@ -1,5 +1,4 @@
-use std::net::IpAddr;
-use tokio::net::unix::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone)]
 pub struct Delta {

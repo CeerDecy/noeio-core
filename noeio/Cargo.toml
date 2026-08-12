@@ -11,7 +11,6 @@ tun = { workspace = true, features = ["async"] }
 tokio = { workspace = true, features = ["full"] }
 clap = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
-pnet = { workspace = true }
 smoltcp = { workspace = true }
 x25519-dalek = { workspace = true, features = ["getrandom"] }
 boringtun = { workspace = true }
@@ -27,4 +26,8 @@ dashmap = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
 async-trait = { workspace = true }
+
+# pnet links against Npcap's Packet.lib on Windows; only the Unix build uses it.
+[target.'cfg(unix)'.dependencies]
+pnet = { workspace = true }
 

@@ -13,3 +13,4 @@ uuid = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["default"] }

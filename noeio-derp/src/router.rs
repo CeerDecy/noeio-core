@@ -1,8 +1,7 @@
 mod delta;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use dashmap::DashMap;
-use tokio::net::unix::SocketAddr;
 
 type NatIPAddr = SocketAddr;
 type VirtualIPAddr = SocketAddr;
