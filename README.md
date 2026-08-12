@@ -4,7 +4,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Noeio is a self-hostable layer-3 mesh networking system. It connects machines across LANs, NATs, and clouds into one private network over a virtual NIC. All data-plane components run on your own infrastructure; no third-party coordination service is involved.
+Noeio is a self-hostable layer-3 mesh networking system with stateless, lightweight nodes. It connects machines across LANs, NATs, and clouds into one private network over a virtual NIC. All data-plane components run on your own infrastructure; no third-party coordination service is involved.
 
 ## Features
 
