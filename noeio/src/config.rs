@@ -19,8 +19,8 @@ impl Config {
                     .unwrap_or_else(|e| panic!("failed to parse config file '{}': {}", p.display(), e))
             }
             None => {
-                let home = std::env::var("HOME").expect("HOME not set");
-                let config_dir = PathBuf::from(&home).join(".noeio");
+                let home = std::env::home_dir().expect("cannot determine home directory");
+                let config_dir = home.join(".noeio");
                 let config_path = config_dir.join("config.toml");
 
                 if !config_path.exists() {

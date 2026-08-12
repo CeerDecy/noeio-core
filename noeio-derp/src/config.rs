@@ -37,8 +37,8 @@ fn default_local() -> bool {
 impl Config {
     pub fn load(path: Option<PathBuf>) -> Self {
         let path = path.unwrap_or_else(|| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            PathBuf::from(&home).join(".noeio").join("derper.toml")
+            let home = std::env::home_dir().expect("cannot determine home directory");
+            home.join(".noeio").join("derper.toml")
         });
 
         let mut config = if path.exists() {
