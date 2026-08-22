@@ -53,12 +53,13 @@ pub struct NoeioDaemon {
 }
 
 impl NoeioDaemon {
-    pub fn new(udp: UdpSocket, cfg: Config) -> Arc<Self> {
-        let derper = DerperManager::from(cfg.derper.clone());
+    pub async fn new(udp: UdpSocket, cfg: Config) -> Arc<Self> {
+        let udp = Arc::new(udp);
+        let derper = DerperManager::new(cfg.derper.clone(), udp.clone()).await;
         let stun = StunManager::from(cfg.stun.clone());
         let daemon = Arc::new(Self {
             nics: NicManager::new(),
-            udp: Arc::new(udp),
+            udp,
             derper,
             stun,
             config: cfg,
@@ -159,7 +160,7 @@ impl NoeioDaemon {
             nat_addr = "none",
             "send_to_peer: relay path",
         );
-        self.udp.send_to(&bytes, derper.address).await
+        self.udp.send_to(&bytes, derper.addr).await
     }
 }
 
@@ -261,50 +262,20 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
         loop {
             tokio::time::sleep(core::time::Duration::from_secs(10)).await;
 
-            let Some(derper) = daemon.derper.current().await else {
-                tracing::warn!("report skipped: no derper server selected, check [derper] config");
+            let derpers = daemon.derper.list().await;
+            if derpers.is_empty() {
+                tracing::warn!(
+                    "report skipped: no derper server with a resolved address, check [derper] config"
+                );
                 continue;
-            };
+            }
 
-            let Some(mut host_info) = daemon.host_info.lock().await.clone() else {
+            let Some(host_info) = daemon.host_info.lock().await.clone() else {
                 tracing::warn!(
                     "report skipped: host_info not initialized, waiting for a STUN response"
                 );
                 continue;
             };
-
-            let addr = match derper.address.parse::<SocketAddr>() {
-                Ok(addr) => addr,
-                Err(err) => {
-                    tracing::error!(
-                        "failed to parse derper address '{}': {}",
-                        derper.address,
-                        err
-                    );
-                    continue;
-                }
-            };
-
-            // Refresh the LAN candidate on every report: the primary route
-            // can change, and the report is what keeps the derper's view
-            // current. The candidate lives on each PeerInfo (the per-network
-            // identity the derper broadcasts); the host-level copy is only
-            // kept for derpers that predate per-peer local_addrs.
-            match daemon.udp.local_addr() {
-                Ok(local) => {
-                    let local_addrs = report_local_addrs(local.port(), addr, &daemon.nics.ips());
-                    for peer in &mut host_info.peers {
-                        peer.local_addrs = local_addrs.clone();
-                    }
-                    host_info.local_addrs = local_addrs;
-                }
-                Err(err) => {
-                    tracing::warn!("report: failed to read local udp port: {}", err);
-                }
-            }
-
-            let payload = ReportPayload::new(derper.token.clone(), host_info).to_bytes();
-            let mut header = PacketHeader::default();
 
             if daemon.nics.peers().len() <= 0 {
                 tracing::warn!("report skipped: no nic registered");
@@ -314,17 +285,45 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
             // TODO
             let peer_id = daemon.nics.peers()[0];
 
-            tracing::info!(peer = %peer_id, "peer id");
+            for derper in &derpers {
+                let addr = derper.addr;
 
-            header.packet_type = NoeioPacketType::Report;
-            header.peer_id = peer_id;
+                // Refresh the LAN candidate on every report: the primary route
+                // can change, and the report is what keeps the derper's view
+                // current. The candidate lives on each PeerInfo (the per-network
+                // identity the derper broadcasts); the host-level copy is only
+                // kept for derpers that predate per-peer local_addrs.
+                let mut host_info = host_info.clone();
+                match daemon.udp.local_addr() {
+                    Ok(local) => {
+                        let local_addrs =
+                            report_local_addrs(local.port(), addr, &daemon.nics.ips());
+                        for peer in &mut host_info.peers {
+                            peer.local_addrs = local_addrs.clone();
+                        }
+                        host_info.local_addrs = local_addrs;
+                    }
+                    Err(err) => {
+                        tracing::warn!("report: failed to read local udp port: {}", err);
+                    }
+                }
 
-            let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
+                let payload = ReportPayload::new(derper.token.clone(), host_info).to_bytes();
+                let mut header = PacketHeader::default();
 
-            if let Err(err) = daemon.udp.send_to(&packet, addr).await {
-                tracing::error!("failed to send host info: {}", err);
+                tracing::info!(peer = %peer_id, "peer id");
+
+                header.packet_type = NoeioPacketType::Report;
+                header.peer_id = peer_id;
+
+                let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
+
+                if let Err(err) = daemon.udp.send_to(&packet, addr).await {
+                    tracing::error!(%derper.address, "failed to send host info: {}", err);
+                } else {
+                    tracing::info!("host info sent to {}", addr);
+                }
             }
-            tracing::info!("host info sent to {}", addr);
         }
     });
 }
@@ -431,12 +430,7 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                             NoeioPacketType::SyncRoute => {
                                 // Route pushes are only trusted from the derper
                                 // we are configured to talk to; drop spoofed ones.
-                                let derper_ip = state
-                                    .derper
-                                    .current()
-                                    .await
-                                    .and_then(|d| d.address.parse::<SocketAddr>().ok())
-                                    .map(|a| a.ip());
+                                let derper_ip = state.derper.current().await.map(|d| d.addr.ip());
                                 if derper_ip != Some(addr.ip()) {
                                     tracing::warn!(
                                         source = %addr,
@@ -488,18 +482,27 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                 }
                             }
                             NoeioPacketType::Report => {}
-                            // Seq/Ack/TunnelPing/TunnelPong are a session's
-                            // signalling traffic. The peer's
-                            // `UdpTunnelSession::dispatch` task owns the handling
-                            // (nonce-matched handshake, Ack/Pong replies, RTT and
-                            // liveness stamps); here we only resolve the peer by
-                            // `peer_id` and hand the raw datagram to its session's
-                            // inbound channel.
+                            // Seq/Ack/TunnelPing are peer-to-peer signalling;
+                            // route them to the peer's UdpTunnelSession.
                             NoeioPacketType::Seq
                             | NoeioPacketType::Ack
-                            | NoeioPacketType::TunnelPing
-                            | NoeioPacketType::TunnelPong => {
+                            | NoeioPacketType::TunnelPing => {
                                 dispatch_signalling(&state, &header, &buf[..n], addr).await;
+                            }
+                            NoeioPacketType::TunnelPong => {
+                                let echo_ts = packet
+                                    .payload()
+                                    .and_then(|p| p.get(..derper::TS_LEN))
+                                    .and_then(|b| b.try_into().ok())
+                                    .map(u64::from_be_bytes);
+
+                                let claimed = match echo_ts {
+                                    Some(ts) => state.derper.dispatch_pong(addr, ts),
+                                    None => false,
+                                };
+                                if !claimed && header.peer_id != 0 {
+                                    dispatch_signalling(&state, &header, &buf[..n], addr).await;
+                                }
                             }
                         }
                         continue;
@@ -706,12 +709,12 @@ mod tests {
     const SAMPLE_NET: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     async fn test_daemon(host_info: Option<HostInfo>) -> NoeioDaemon {
-        let udp = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
         NoeioDaemon {
             nics: NicManager::new(),
-            udp: Arc::new(udp),
+            udp: udp.clone(),
             config: Config::default(),
-            derper: DerperManager::from(crate::config::Derper::default()),
+            derper: DerperManager::new(crate::config::Derper::default(), udp).await,
             stun: StunManager::from(crate::config::Stun::default()),
             host_info: Mutex::new(host_info),
             router: Router::new(),

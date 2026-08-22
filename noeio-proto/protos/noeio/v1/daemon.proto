@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package noeio.v1;
+
+message DerperRtt {
+  string address = 1;
+  uint64 rtt_ms = 2;
+}
+
+message NetCheckRequest {}
+
+message NetCheckResponse {
+  repeated DerperRtt derpers = 1;
+}
+
+service DaemonService {
+  rpc NetCheck(NetCheckRequest) returns (NetCheckResponse);
+}
