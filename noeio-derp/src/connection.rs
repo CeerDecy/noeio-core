@@ -173,10 +173,21 @@ impl ConnectionManager {
                     }
                     NoeioPacketType::Seq
                     | NoeioPacketType::Ack
-                    | NoeioPacketType::TunnelPing
                     | NoeioPacketType::TunnelPong => {
-                        // Hole-punch and ping/pong signalling is peer-to-peer;
+                        // Hole-punch and pong signalling is peer-to-peer;
                         // the relay does not act on it.
+                    }
+                    NoeioPacketType::TunnelPing => {
+                        let pong_header = PacketHeader {
+                            packet_type: NoeioPacketType::TunnelPong,
+                            peer_id: packet.parse_header().map(|h| h.peer_id).unwrap_or(0),
+                            port: 0,
+                        };
+                        let payload = packet.payload().unwrap_or(&[]).to_vec();
+                        let pong: Vec<u8> = NoeioPacket::new(pong_header, &payload).into();
+                        if let Err(err) = udp.send_to(&pong, addr).await {
+                            tracing::warn!(%addr, "failed to send TunnelPong: {}", err);
+                        }
                     }
                     NoeioPacketType::Report => {
                         let header = match packet.parse_header() {

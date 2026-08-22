@@ -22,8 +22,8 @@ pub enum Command {
     },
     /// Discover public address via STUN
     Stun,
-    /// Run overlay network connectivity test
-    OverlayTest,
+    /// Check Derper relay server RTT latency
+    Netcheck,
     /// List resources
     List {
         #[command(subcommand)]
