@@ -81,7 +81,7 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    noeio-derp token create --network 25fe8468-b310-43ed-96be-495641eececd --ttl 0
    ```
 
-3. 在每个需要加入虚拟网络的节点上，更新 `~/.noeio/config.toml`——注意将 `address` 替换为你自己的 derper 地址，将 `token` 替换为第二步生成的 token：
+3. 在每个需要加入虚拟网络的节点上，更新 `~/.noeio/config.toml`——注意将 `address` 替换为你自己的 derper 地址，将 `token` 替换为第二步生成的 token。可以参考项目根目录下的 [`config.toml.example`](config.toml.example)：
 
    ```toml
    [stun]

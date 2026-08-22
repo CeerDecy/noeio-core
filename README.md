@@ -81,7 +81,7 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    noeio-derp token create --network 25fe8468-b310-43ed-96be-495641eececd --ttl 0
    ```
 
-3. On every node that should join the virtual network, update `~/.noeio/config.toml` (on Windows: `%USERPROFILE%\.noeio\config.toml`, e.g. `C:\Users\<username>\.noeio\config.toml`) — make sure to replace `address` with your own derper's address and `token` with the token created in step 2:
+3. On every node that should join the virtual network, update `~/.noeio/config.toml` (on Windows: `%USERPROFILE%\.noeio\config.toml`, e.g. `C:\Users\<username>\.noeio\config.toml`) — make sure to replace `address` with your own derper's address and `token` with the token created in step 2. You can use [`config.toml.example`](config.toml.example) in the project root as a reference:
 
    ```toml
    [stun]
