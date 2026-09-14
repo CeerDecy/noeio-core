@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package noeio.common.v1;
+
+message PeerInfo {
+  uint64 resource_version = 1;
+  uint32 peer_id = 2;
+  bytes noeio_ip = 3;
+  bytes network_id = 4;
+  uint32 nat_type = 5;
+  string nat_addr = 6;
+  repeated string local_addrs = 7;
+}
+
+message HostInfo {
+  uint64 resource_version = 1;
+  string nat_addr = 2;
+  uint32 nat_type = 3;
+  string hostname = 4;
+  repeated string local_addrs = 5;
+  repeated PeerInfo peers = 6;
+}

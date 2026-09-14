@@ -28,6 +28,9 @@ fn main() {
     if env::var_os("CARGO_FEATURE_NOEIO_DERPER").is_some() {
         proto_files.extend(collect_proto_files(&proto_dir.join("noeio-derper")));
     }
+    if env::var_os("CARGO_FEATURE_COMMON").is_some() {
+        proto_files.extend(collect_proto_files(&proto_dir.join("common")));
+    }
     println!("Generated files: {:?}", proto_files);
 
     if proto_files.is_empty() {

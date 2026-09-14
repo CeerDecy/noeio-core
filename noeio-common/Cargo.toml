@@ -9,6 +9,8 @@ hostname = { workspace = true }
 smoltcp = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
+noeio-proto = { workspace = true, features = ["common"] }
+prost = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true }

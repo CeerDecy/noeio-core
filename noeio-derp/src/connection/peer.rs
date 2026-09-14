@@ -30,6 +30,20 @@ impl PeerManager {
     }
 
     pub fn heartbeat(&self, peer_id: PeerId, info: HostInfo, addr: SocketAddr, network: NetworkId) {
+        if let Some((prev_addr, prev_info, prev_network)) = self.peers.get(&peer_id) {
+            // Reports are ordered by the HostInfo resource version.  A stale
+            // or duplicate report must not roll the route back or trigger a
+            // new SyncRoute broadcast.  Reinsert the current value so the
+            // periodic report still refreshes the liveness TTL.
+            if info.resource_version <= prev_info.resource_version {
+                self.peers
+                    .insert(peer_id, (prev_addr, prev_info, prev_network));
+                self.by_addr
+                    .insert((prev_addr, prev_network), peer_id);
+                return;
+            }
+        }
+
         let changed =
             self.peers
                 .get(&peer_id)
@@ -126,5 +140,41 @@ mod tests {
         manager.remove(&10);
 
         assert_eq!(manager.peer_id_by_addr(&addr(1000), &net), None);
+    }
+
+    #[test]
+    fn stale_resource_version_does_not_replace_route() {
+        let manager = manager();
+        let net: NetworkId = [1u8; 16];
+        let mut current = HostInfo::new(addr(1000));
+        current.resource_version = 20;
+        manager.heartbeat(10, current.clone(), addr(1000), net);
+
+        let mut stale = HostInfo::new(addr(2000));
+        stale.resource_version = 19;
+        manager.heartbeat(10, stale, addr(2000), net);
+
+        let (stored_addr, stored_info, stored_network) = manager.get(&10).unwrap();
+        assert_eq!(stored_addr, addr(1000));
+        assert_eq!(stored_info.resource_version, 20);
+        assert_eq!(stored_network, net);
+        assert_eq!(manager.peer_id_by_addr(&addr(2000), &net), None);
+    }
+
+    #[test]
+    fn equal_resource_version_does_not_replace_route() {
+        let manager = manager();
+        let net: NetworkId = [1u8; 16];
+        let mut current = HostInfo::new(addr(1000));
+        current.resource_version = 20;
+        manager.heartbeat(10, current.clone(), addr(1000), net);
+
+        let mut duplicate = HostInfo::new(addr(2000));
+        duplicate.resource_version = 20;
+        manager.heartbeat(10, duplicate, addr(2000), net);
+
+        let (stored_addr, stored_info, _) = manager.get(&10).unwrap();
+        assert_eq!(stored_addr, addr(1000));
+        assert_eq!(stored_info, current);
     }
 }
