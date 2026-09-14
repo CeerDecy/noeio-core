@@ -446,10 +446,23 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                             // this peer's network (SyncRoute is
                                             // addressed to us); the session stamps
                                             // it into the signalling it sends.
-                                            match state.router.get(&peer.noeio_ip) {
+                                            let route_needed = match state.router.get(&peer.noeio_ip) {
                                                 Some(existing) => {
-                                                    existing
-                                                        .update_info(peer.clone(), header.peer_id);
+                                                    let current_version =
+                                                        existing.info().resource_version;
+                                                    if peer.resource_version > current_version {
+                                                        existing
+                                                            .update_info(peer.clone(), header.peer_id);
+                                                        true
+                                                    } else {
+                                                        tracing::debug!(
+                                                            peer = %peer.peer_id,
+                                                            incoming = peer.resource_version,
+                                                            current = current_version,
+                                                            "skipping stale SyncRoute"
+                                                        );
+                                                        false
+                                                    }
                                                 }
                                                 None => {
                                                     state.router.insert(Peer::new(
@@ -457,19 +470,22 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                                         state.udp.clone(),
                                                         header.peer_id,
                                                     ));
+                                                    true
                                                 }
-                                            }
-                                            if let Err(err) = state
-                                                .nics
-                                                .route(Some(header.peer_id), peer.noeio_ip)
-                                                .await
-                                            {
-                                                tracing::error!(
-                                                    "Failed to route peer {} via local nic {}: {}",
-                                                    peer.noeio_ip,
-                                                    header.peer_id,
-                                                    err
-                                                );
+                                            };
+                                            if route_needed {
+                                                if let Err(err) = state
+                                                    .nics
+                                                    .route(Some(header.peer_id), peer.noeio_ip)
+                                                    .await
+                                                {
+                                                    tracing::error!(
+                                                        "Failed to route peer {} via local nic {}: {}",
+                                                        peer.noeio_ip,
+                                                        header.peer_id,
+                                                        err
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(err) => {
@@ -535,6 +551,7 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                     );
                                     existing.nat_type = nat_type;
                                     existing.nat_addr = new_info.nat_addr;
+                                    existing.resource_version = new_info.resource_version;
                                     existing.hostname = new_info.hostname;
                                 }
                                 None => {

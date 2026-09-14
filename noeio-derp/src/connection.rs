@@ -316,6 +316,7 @@ impl ConnectionManager {
                             };
                             let info = peer_info
                                 .clone()
+                                .with_resource_version(info.resource_version)
                                 .with_nat_type(info.nat_type)
                                 .with_nat_addr(Some(info.nat_addr))
                                 .with_local_addrs(local_addrs);

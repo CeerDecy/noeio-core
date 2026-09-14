@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub type PeerId = u32;
@@ -61,6 +62,7 @@ pub struct NetworkInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
+    pub resource_version: u64,
     pub peer_id: PeerId,
     pub noeio_ip: IpAddr,
     pub network_id: NetworkId,
@@ -78,6 +80,7 @@ impl PeerInfo {
     pub fn new(peer_id: PeerId, vip: IpAddr, network: &str) -> Result<Self, uuid::Error> {
         let network_id = Uuid::parse_str(network)?.into_bytes();
         Ok(Self {
+            resource_version: 0,
             peer_id,
             noeio_ip: vip,
             network_id,
@@ -85,6 +88,11 @@ impl PeerInfo {
             nat_addr: None,
             local_addrs: Vec::new(),
         })
+    }
+
+    pub fn with_resource_version(mut self, resource_version: u64) -> Self {
+        self.resource_version = resource_version;
+        self
     }
 
     pub fn with_nat_type(mut self, nat_type: NatType) -> Self {
@@ -133,13 +141,14 @@ impl From<&PeerInfo> for String {
             .map(|addr| addr.to_string())
             .unwrap_or_default();
         format!(
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             peer.peer_id,
             peer.noeio_ip,
             Uuid::from_bytes(peer.network_id).hyphenated(),
             peer.nat_type,
             nat_addr,
             join_addrs(&peer.local_addrs)
+            ,peer.resource_version
         )
     }
 }
@@ -155,7 +164,7 @@ impl TryFrom<&str> for PeerInfo {
 
     fn try_from(entry: &str) -> Result<Self, Self::Error> {
         let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid peer entry");
-        let mut fields = entry.splitn(6, ',');
+        let mut fields = entry.splitn(7, ',');
         let peer_id_str = fields.next().ok_or_else(invalid)?;
         let vip_str = fields.next().ok_or_else(invalid)?;
         let network_str = fields.next().ok_or_else(invalid)?;
@@ -164,6 +173,7 @@ impl TryFrom<&str> for PeerInfo {
         // Optional trailing field: a sender that predates local-address
         // reporting emits five fields, which parses as "no LAN candidates".
         let local_addrs_str = fields.next().unwrap_or("");
+        let resource_version: u64 = fields.next().unwrap_or("0").parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let peer_id: PeerId = peer_id_str
             .parse()
@@ -185,7 +195,8 @@ impl TryFrom<&str> for PeerInfo {
         let local_addrs = parse_addrs(local_addrs_str)?;
         PeerInfo::new(peer_id, vip, network_str)
             .map(|peer| {
-                peer.with_nat_type(nat_type)
+                peer.with_resource_version(resource_version)
+                    .with_nat_type(nat_type)
                     .with_nat_addr(nat_addr)
                     .with_local_addrs(local_addrs)
             })
@@ -206,6 +217,7 @@ impl TryFrom<&[u8]> for PeerInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostInfo {
+    pub resource_version: u64,
     pub nat_addr: SocketAddr,
     pub nat_type: NatType,
     pub hostname: String,
@@ -224,6 +236,7 @@ impl HostInfo {
             .to_string_lossy()
             .to_string();
         Self {
+            resource_version: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64,
             nat_addr,
             nat_type: NatType::default(),
             hostname,
@@ -256,12 +269,14 @@ impl HostInfo {
         // "no LAN candidates" — so an upgraded receiver keeps accepting
         // legacy reports.
         format!(
-            "{}\r\n{}\r\n{}\r\n{}\r\n{}",
+            "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
             self.nat_addr,
             self.nat_type,
             self.hostname,
             networks_str,
             join_addrs(&self.local_addrs)
+            ,self.resource_version
+            
         )
         .into_bytes()
     }
@@ -273,7 +288,7 @@ impl TryFrom<&[u8]> for HostInfo {
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
         let s = std::str::from_utf8(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut parts = s.splitn(5, "\r\n");
+        let mut parts = s.splitn(6, "\r\n");
         let addr_str = parts
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing addr"))?;
@@ -290,6 +305,7 @@ impl TryFrom<&[u8]> for HostInfo {
         // Optional trailing segment (see `to_bytes`): absent in legacy
         // payloads, which predate local-address reporting.
         let local_addrs_str = parts.next().unwrap_or("");
+        let resource_version: u64 = parts.next().unwrap_or("0").trim().parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let nat_addr: SocketAddr = addr_str
             .parse()
@@ -309,6 +325,7 @@ impl TryFrom<&[u8]> for HostInfo {
         };
 
         Ok(HostInfo {
+            resource_version,
             nat_addr,
             nat_type,
             hostname,
@@ -359,6 +376,7 @@ mod tests {
             PeerInfo::new(new_peer_id(), IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), SAMPLE_NET_B).unwrap(),
         ];
         let info = HostInfo {
+            resource_version: 1,
             nat_addr: sample_addr(),
             nat_type: NatType::Symmetric,
             hostname: "example-host".to_string(),
@@ -385,6 +403,7 @@ mod tests {
     #[test]
     fn to_bytes_with_empty_networks() {
         let info = HostInfo {
+            resource_version: 1,
             nat_addr: sample_addr(),
             nat_type: NatType::Other,
             hostname: "h".to_string(),
@@ -479,6 +498,7 @@ mod tests {
     #[test]
     fn host_info_roundtrips_local_addrs() {
         let info = HostInfo {
+            resource_version: 1,
             nat_addr: sample_addr(),
             nat_type: NatType::Other,
             hostname: "h".to_string(),
