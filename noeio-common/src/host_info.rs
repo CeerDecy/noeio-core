@@ -1,9 +1,18 @@
+use noeio_proto::proto::common::v1::{HostInfo as ProtoHostInfo, PeerInfo as ProtoPeerInfo};
+use prost::Message;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub type PeerId = u32;
 pub type NetworkId = [u8; 16];
+
+fn nat_type_from_proto(value: u32) -> Result<NatType, std::io::Error> {
+    let value = u8::try_from(value).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nat type")
+    })?;
+    NatType::try_from(value)
+}
 
 pub fn new_peer_id() -> PeerId {
     rand::random()
@@ -147,15 +156,15 @@ impl From<&PeerInfo> for String {
             Uuid::from_bytes(peer.network_id).hyphenated(),
             peer.nat_type,
             nat_addr,
-            join_addrs(&peer.local_addrs)
-            ,peer.resource_version
+            join_addrs(&peer.local_addrs),
+            peer.resource_version
         )
     }
 }
 
 impl From<&PeerInfo> for Vec<u8> {
     fn from(peer: &PeerInfo) -> Self {
-        String::from(peer).into_bytes()
+        ProtoPeerInfo::from(peer).encode_to_vec()
     }
 }
 
@@ -173,7 +182,11 @@ impl TryFrom<&str> for PeerInfo {
         // Optional trailing field: a sender that predates local-address
         // reporting emits five fields, which parses as "no LAN candidates".
         let local_addrs_str = fields.next().unwrap_or("");
-        let resource_version: u64 = fields.next().unwrap_or("0").parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let resource_version: u64 = fields
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let peer_id: PeerId = peer_id_str
             .parse()
@@ -208,12 +221,16 @@ impl TryFrom<&[u8]> for PeerInfo {
     type Error = std::io::Error;
 
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        if let Ok(proto) = ProtoPeerInfo::decode(data) {
+            if let Ok(peer) = Self::try_from(proto) {
+                return Ok(peer);
+            }
+        }
         let s = std::str::from_utf8(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         PeerInfo::try_from(s)
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostInfo {
@@ -223,8 +240,8 @@ pub struct HostInfo {
     pub hostname: String,
     /// Deprecated: LAN candidates now travel on each [`PeerInfo`]
     /// (`PeerInfo::local_addrs`), the per-network identity the derper
-    /// actually broadcasts. This host-level copy is still written so older
-    /// derpers keep working; remove it together with their fallback path.
+    /// actually broadcasts. This host-level copy is retained for legacy
+    /// payload parsing and older peers.
     pub local_addrs: Vec<SocketAddr>,
     pub peers: Vec<PeerInfo>,
 }
@@ -236,7 +253,10 @@ impl HostInfo {
             .to_string_lossy()
             .to_string();
         Self {
-            resource_version: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64,
+            resource_version: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
             nat_addr,
             nat_type: NatType::default(),
             hostname,
@@ -256,29 +276,35 @@ impl HostInfo {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        // TODO: replace this ad-hoc text format with a binary encoding (protobuf / bincode)
-        // once the field set stabilizes — the `\r\n` / `;` / `,` / `|` layering will not scale.
-        let networks_str: String = self
-            .peers
-            .iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
-            .join(";");
-        // `local_addrs` deliberately comes last: a legacy sender emits only
-        // the first four segments, and a missing trailing segment parses as
-        // "no LAN candidates" — so an upgraded receiver keeps accepting
-        // legacy reports.
-        format!(
-            "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
-            self.nat_addr,
-            self.nat_type,
-            self.hostname,
-            networks_str,
-            join_addrs(&self.local_addrs)
-            ,self.resource_version
-            
-        )
-        .into_bytes()
+        let proto = ProtoHostInfo {
+            resource_version: self.resource_version,
+            nat_addr: self.nat_addr.to_string(),
+            nat_type: u8::from(self.nat_type) as u32,
+            hostname: self.hostname.clone(),
+            local_addrs: self.local_addrs.iter().map(ToString::to_string).collect(),
+            peers: self.peers.iter().map(ProtoPeerInfo::from).collect(),
+        };
+        proto.encode_to_vec()
+    }
+}
+
+impl From<&PeerInfo> for ProtoPeerInfo {
+    fn from(peer: &PeerInfo) -> Self {
+        Self {
+            resource_version: peer.resource_version,
+            peer_id: peer.peer_id,
+            noeio_ip: match peer.noeio_ip {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            },
+            network_id: peer.network_id.to_vec(),
+            nat_type: u8::from(peer.nat_type) as u32,
+            nat_addr: peer
+                .nat_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_default(),
+            local_addrs: peer.local_addrs.iter().map(ToString::to_string).collect(),
+        }
     }
 }
 
@@ -286,6 +312,46 @@ impl TryFrom<&[u8]> for HostInfo {
     type Error = std::io::Error;
 
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        if let Ok(proto) = ProtoHostInfo::decode(data) {
+            if let Ok(info) = Self::try_from_proto(proto) {
+                return Ok(info);
+            }
+        }
+        Self::try_from_legacy(data)
+    }
+}
+
+impl HostInfo {
+    fn try_from_proto(proto: ProtoHostInfo) -> Result<Self, std::io::Error> {
+        let nat_addr = proto
+            .nat_addr
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let nat_type = nat_type_from_proto(proto.nat_type)?;
+        let local_addrs = proto
+            .local_addrs
+            .iter()
+            .map(|addr| {
+                addr.parse()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+            .collect::<Result<Vec<SocketAddr>, _>>()?;
+        let peers = proto
+            .peers
+            .into_iter()
+            .map(PeerInfo::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            resource_version: proto.resource_version,
+            nat_addr,
+            nat_type,
+            hostname: proto.hostname,
+            local_addrs,
+            peers,
+        })
+    }
+
+    fn try_from_legacy(data: &[u8]) -> Result<Self, std::io::Error> {
         let s = std::str::from_utf8(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut parts = s.splitn(6, "\r\n");
@@ -305,7 +371,12 @@ impl TryFrom<&[u8]> for HostInfo {
         // Optional trailing segment (see `to_bytes`): absent in legacy
         // payloads, which predate local-address reporting.
         let local_addrs_str = parts.next().unwrap_or("");
-        let resource_version: u64 = parts.next().unwrap_or("0").trim().parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let resource_version: u64 = parts
+            .next()
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let nat_addr: SocketAddr = addr_str
             .parse()
@@ -335,10 +406,66 @@ impl TryFrom<&[u8]> for HostInfo {
     }
 }
 
+impl TryFrom<ProtoPeerInfo> for PeerInfo {
+    type Error = std::io::Error;
+
+    fn try_from(proto: ProtoPeerInfo) -> Result<Self, Self::Error> {
+        let noeio_ip = match proto.noeio_ip.as_slice() {
+            [a, b, c, d] => IpAddr::from([*a, *b, *c, *d]),
+            bytes if bytes.len() == 16 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(bytes);
+                IpAddr::from(octets)
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid noeio ip",
+                ));
+            }
+        };
+        if proto.network_id.len() != 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid network id",
+            ));
+        }
+        let mut network_id = [0u8; 16];
+        network_id.copy_from_slice(&proto.network_id);
+        let nat_addr = if proto.nat_addr.is_empty() {
+            None
+        } else {
+            Some(
+                proto
+                    .nat_addr
+                    .parse()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            )
+        };
+        let local_addrs = proto
+            .local_addrs
+            .iter()
+            .map(|addr| {
+                addr.parse()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+            .collect::<Result<Vec<SocketAddr>, _>>()?;
+        Ok(Self {
+            resource_version: proto.resource_version,
+            peer_id: proto.peer_id,
+            noeio_ip,
+            network_id,
+            nat_type: nat_type_from_proto(proto.nat_type)?,
+            nat_addr,
+            local_addrs,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn sample_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 51820)
@@ -358,22 +485,44 @@ mod tests {
     #[test]
     fn with_networks_replaces_networks() {
         let nets = vec![
-            PeerInfo::new(new_peer_id(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), SAMPLE_NET_A).unwrap(),
-            PeerInfo::new(new_peer_id(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), SAMPLE_NET_B).unwrap(),
+            PeerInfo::new(
+                new_peer_id(),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                SAMPLE_NET_A,
+            )
+            .unwrap(),
+            PeerInfo::new(
+                new_peer_id(),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                SAMPLE_NET_B,
+            )
+            .unwrap(),
         ];
         let info = HostInfo::new(sample_addr()).with_networks(nets.clone());
         assert_eq!(info.peers.len(), 2);
         assert_eq!(info.peers[0].peer_id, nets[0].peer_id);
-        assert_eq!(info.peers[1].noeio_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(
+            info.peers[1].noeio_ip,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
     }
 
     #[test]
     fn to_bytes_and_try_from_roundtrip() {
         let nets = vec![
-            PeerInfo::new(new_peer_id(), IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), SAMPLE_NET_A)
-                .unwrap()
-                .with_nat_type(NatType::Symmetric),
-            PeerInfo::new(new_peer_id(), IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), SAMPLE_NET_B).unwrap(),
+            PeerInfo::new(
+                new_peer_id(),
+                IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+                SAMPLE_NET_A,
+            )
+            .unwrap()
+            .with_nat_type(NatType::Symmetric),
+            PeerInfo::new(
+                new_peer_id(),
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+                SAMPLE_NET_B,
+            )
+            .unwrap(),
         ];
         let info = HostInfo {
             resource_version: 1,
@@ -390,6 +539,7 @@ mod tests {
         assert_eq!(parsed.nat_addr, info.nat_addr);
         assert_eq!(parsed.nat_type, info.nat_type);
         assert_eq!(parsed.hostname, info.hostname);
+        assert_eq!(parsed.resource_version, info.resource_version);
         assert_eq!(parsed.local_addrs, info.local_addrs);
         assert_eq!(parsed.peers.len(), info.peers.len());
         for (a, b) in parsed.peers.iter().zip(info.peers.iter()) {
@@ -397,6 +547,7 @@ mod tests {
             assert_eq!(a.noeio_ip, b.noeio_ip);
             assert_eq!(a.network_id, b.network_id);
             assert_eq!(a.nat_type, b.nat_type);
+            assert_eq!(a.resource_version, b.resource_version);
         }
     }
 
@@ -411,12 +562,10 @@ mod tests {
             peers: Vec::new(),
         };
         let bytes = info.to_bytes();
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.ends_with("\r\n"));
-
         let parsed = HostInfo::try_from(bytes.as_slice()).unwrap();
         assert!(parsed.peers.is_empty());
         assert_eq!(parsed.hostname, "h");
+        assert_eq!(parsed.resource_version, 1);
     }
 
     #[test]
@@ -456,7 +605,8 @@ mod tests {
 
     #[test]
     fn try_from_rejects_invalid_vip() {
-        let data = b"203.0.113.5:51820\r\n1\r\nhost\r\n1,not-an-ip,550e8400-e29b-41d4-a716-446655440000,1";
+        let data =
+            b"203.0.113.5:51820\r\n1\r\nhost\r\n1,not-an-ip,550e8400-e29b-41d4-a716-446655440000,1";
         let err = HostInfo::try_from(data.as_slice()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
@@ -516,6 +666,7 @@ mod tests {
     fn peer_info_roundtrips_local_addrs() {
         let info = PeerInfo::new(42, IpAddr::V4(Ipv4Addr::new(10, 64, 0, 2)), SAMPLE_NET_A)
             .unwrap()
+            .with_resource_version(7)
             .with_nat_addr(Some(sample_addr()))
             .with_local_addrs(vec![
                 "192.168.1.10:41641".parse().unwrap(),
@@ -523,6 +674,10 @@ mod tests {
             ]);
         let wire = String::from(&info);
         let parsed = PeerInfo::try_from(wire.as_str()).unwrap();
+        assert_eq!(parsed, info);
+
+        let protobuf_wire: Vec<u8> = (&info).into();
+        let parsed = PeerInfo::try_from(protobuf_wire.as_slice()).unwrap();
         assert_eq!(parsed, info);
     }
 

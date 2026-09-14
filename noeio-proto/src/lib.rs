@@ -13,6 +13,13 @@ pub mod proto {
         }
     }
 
+    #[cfg(feature = "common")]
+    pub mod common {
+        pub mod v1 {
+            tonic::include_proto!("noeio.common.v1");
+        }
+    }
+
     #[cfg(any(feature = "noeio", feature = "noeio-derper"))]
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("descriptor");
 }
