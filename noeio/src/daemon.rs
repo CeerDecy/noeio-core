@@ -451,8 +451,11 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                                     let current_version =
                                                         existing.info().resource_version;
                                                     if peer.resource_version > current_version {
-                                                        existing
-                                                            .update_info(peer.clone(), header.peer_id);
+                                                        state.router.update_info(
+                                                            &existing,
+                                                            peer.clone(),
+                                                            header.peer_id,
+                                                        );
                                                         true
                                                     } else {
                                                         tracing::debug!(
