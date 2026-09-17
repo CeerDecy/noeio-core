@@ -134,6 +134,48 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
 
 ## 构建
 
+### 在 Docker 中构建各平台二进制
+
+只需本机安装并启动 Docker（Linux 容器），无需安装或修改本机 Rust 环境：
+
+```bash
+make binaries
+# 也可只构建指定平台
+make binaries PLATFORMS="linux-amd64 linux-arm64 windows-amd64"
+```
+
+仅构建 `noeio`。发布文件名中，x86_64 使用 `amd64`，Linux ARM64 使用 `arm64`，
+macOS ARM64 使用 `aarch64`。两种系统的 Rust ARM64 编译目标均使用 `aarch64`。
+默认在 `build/out/` 下生成：
+
+- `noeio-linux-amd64`
+- `noeio-linux-arm64`
+- `noeio-macos-amd64`
+- `noeio-macos-aarch64`
+- `noeio-windows-amd64.exe`
+
+每个二进制附带同名 `.sha256` 校验文件。Linux 使用 musl，Windows 使用 GNU/MinGW，
+macOS 最低目标版本为 11.0。
+
+构建 macOS 目标需要在 Mac 上安装 Xcode 或 Command Line Tools。
+脚本统一通过以下命令自动获取 SDK 路径：
+
+```bash
+xcrun --sdk macosx --show-sdk-path
+```
+
+仅构建 Linux/Windows 目标时不需要 `xcrun` 或 Apple SDK。
+SDK 和项目源码只读挂载，编译工具安装在 Docker 镜像内，依赖及编译缓存保存在
+`noeio-cross-cache-v1` Docker volume 中，不使用本机的 Cargo 配置、Rust 工具链或 `target/`。
+首次运行需要联网下载镜像和依赖，后续运行复用缓存。不要同时运行多个使用同一缓存卷的构建。
+存在 `Cargo.lock` 时复用它，否则在容器内生成；本次构建的锁文件保存到 `build/out/Cargo.lock`。
+可用 `BUILD_IMAGE`、`BUILD_CACHE` 指定镜像名和缓存卷名；这些变量可作为 `make` 参数传入；脚本选项见 `./scripts/build-binaries.sh --help`。
+如果 Docker Hub 无法访问，可指定基础镜像源，例如
+`make binaries RUST_IMAGE=m.daocloud.io/docker.io/rust:1.94-bookworm`。
+脚本仅生成二进制，不包含 macOS 签名/公证或 Windows TUN 驱动等运行时组件。
+
+### 本机编译
+
 构建 derper 二进制：
 
 ```bash

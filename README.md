@@ -134,6 +134,53 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
 
 ## Build
 
+### Build binaries in Docker
+
+Start Docker with Linux containers; no host Rust installation or changes are needed:
+
+```bash
+make binaries
+# Or select platforms
+make binaries PLATFORMS="linux-amd64 linux-arm64 windows-amd64"
+```
+
+Only `noeio` is built. Release names use `amd64` for x86_64, `arm64` for
+Linux ARM64, and `aarch64` for macOS ARM64. Rust ARM64 compilation targets
+use `aarch64` on both operating systems. The default outputs in `build/out/` are:
+
+- `noeio-linux-amd64`
+- `noeio-linux-arm64`
+- `noeio-macos-amd64`
+- `noeio-macos-aarch64`
+- `noeio-windows-amd64.exe`
+
+Each binary has a matching `.sha256` checksum file. Linux uses musl, Windows
+uses GNU/MinGW, and the macOS deployment target is 11.0.
+
+macOS targets require a Mac with Xcode or Command Line Tools installed.
+The script always locates the SDK automatically using:
+
+```bash
+xcrun --sdk macosx --show-sdk-path
+```
+
+Building only Linux/Windows targets does not require `xcrun` or an Apple SDK.
+The SDK and sources are mounted read-only. Tools live in the Docker image;
+dependencies and build artifacts are cached in the `noeio-cross-cache-v1` Docker
+volume, without using the host Cargo configuration, Rust toolchain, or `target/`.
+The first build downloads the image and dependencies; later builds reuse caches.
+An existing `Cargo.lock` is reused; otherwise one is generated inside the container.
+The lockfile used for the build is saved to `build/out/Cargo.lock`.
+Do not run concurrent builds sharing the same cache volume. Override `BUILD_IMAGE`
+or `BUILD_CACHE` as Make variables to change their names; see
+`./scripts/build-binaries.sh --help` for script details.
+If Docker Hub is unavailable, select a base image mirror, for example:
+`make binaries RUST_IMAGE=m.daocloud.io/docker.io/rust:1.94-bookworm`.
+The script produces binaries only; macOS signing/notarization and runtime components
+such as Windows TUN drivers are not included.
+
+### Native build
+
 Build the derper binary:
 
 ```bash
