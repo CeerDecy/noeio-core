@@ -3,7 +3,7 @@ use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use smoltcp::phy::PcapLinkType::Ip;
-use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer, ToAddress};
+use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer};
 
 /// MTU of the virtual nic, sized so a full inner packet never fragments the
 /// outer datagram on a 1500-byte physical path, even over IPv6:
@@ -22,30 +22,21 @@ pub struct VirtualNic {
 }
 
 impl VirtualNic {
-    pub async fn create_ipv4_nic(ip: Ipv4Addr) -> (VirtualNic, DeviceReader) {
-        let device = Self::create_tun().unwrap();
+    pub async fn create_ipv4_nic(
+        ip: Ipv4Addr,
+    ) -> Result<(VirtualNic, DeviceReader), Box<dyn Error>> {
+        let device = Self::create_tun(ip)?;
+        let tun_name = device.tun_name()?;
+        let (tun_writer, tun_reader) = device.split()?;
 
-        let tun_name = device.tun_name().unwrap();
-
-        // set host ip
-        #[cfg(unix)]
-        let cmd = format!("ifconfig {} {:?}/{} {:?} up", tun_name, ip, "32", ip);
-        // Windows has no ifconfig; wintun adapters are configured via netsh.
-        // A /32 host mask matches the point-to-point setup used on Unix.
-        #[cfg(windows)]
-        let cmd = format!(
-            "netsh interface ipv4 set address name=\"{}\" source=static address={} mask=255.255.255.255",
-            tun_name, ip
-        );
-        run_command(&cmd).await.unwrap();
-
-        let (tun_writer, tun_reader) = device.split().unwrap();
-
-        (VirtualNic {
-            writer: tun_writer,
-            tun_name,
-            ip: IpAddr::V4(ip),
-        }, tun_reader)
+        Ok((
+            VirtualNic {
+                writer: tun_writer,
+                tun_name,
+                ip: IpAddr::V4(ip),
+            },
+            tun_reader,
+        ))
     }
 
     pub async fn add_router_rule(
@@ -87,13 +78,29 @@ impl VirtualNic {
         run_command(&cmd).await
     }
 
-    fn create_tun() -> Result<tun::AsyncDevice, Box<dyn std::error::Error>> {
+    fn create_tun(ip: Ipv4Addr) -> Result<tun::AsyncDevice, Box<dyn Error>> {
         let mut config = tun::Configuration::default();
         config.layer(Layer::L3);
         config.mtu(NIC_MTU);
+        config.up();
 
-        // macOS kernel requires utun interface names to be `utunN`, so a
-        // custom name can only be set on other platforms.
+        // The crate applies these through the platform's own API — ioctl on
+        // Unix, the wintun adapter API on Windows — so the image doesn't need
+        // ifconfig or netsh. A /32 host mask reproduces the point-to-point
+        // setup those commands used to install. configure() applies the
+        // address before enabling the interface, matching `ifconfig A/32 A up`.
+        config.address(ip);
+        config.netmask(Ipv4Addr::new(255, 255, 255, 255));
+
+        // On Unix `destination` is the point-to-point peer, which is ourselves.
+        // On Windows the crate maps this field to the adapter's *default
+        // gateway*, so setting it would point the host's default route at
+        // noeio rather than leaving our per-peer split-tunnel routes as the
+        // only ones we add.
+        #[cfg(not(target_os = "windows"))]
+        config.destination(ip);
+
+        // macOS requires `utunN`, so a custom name can only be set elsewhere.
         #[cfg(not(target_os = "macos"))]
         config.tun_name("noeio0");
 
@@ -101,8 +108,6 @@ impl VirtualNic {
         config.platform_config(|config| {
             config.packet_information(false);
         });
-
-        config.up();
 
         Ok(tun::create_as_async(&config)?)
     }

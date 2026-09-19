@@ -20,28 +20,13 @@ pub enum Command {
         #[arg(short, long, default_value_t = 2026)]
         port: u16,
     },
-    /// Discover public address via STUN
-    Stun,
     /// Check Derper relay server RTT latency
     Netcheck,
-    /// List resources
-    List {
-        #[command(subcommand)]
-        resource: ListResource,
-    },
     /// Create a new resource
     Create {
         #[command(subcommand)]
         resource: CreateResource,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ListResource {
-    /// List all networks
-    Network,
-    /// List all virtual NICs
-    Vnic,
 }
 
 #[derive(Subcommand, Debug)]

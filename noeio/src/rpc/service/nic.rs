@@ -28,7 +28,12 @@ impl VirtualNicService for VirtualNicServiceImpl {
             .parse::<Ipv4Addr>()
             .map_err(|_| Status::invalid_argument(format!("invalid ip address: '{}'", req.ip)))?;
 
-        let (nic, reader) = VirtualNic::create_ipv4_nic(ip_addr).await;
+        let (nic, reader) = VirtualNic::create_ipv4_nic(ip_addr).await.map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to create virtual nic for {}: {}",
+                req.ip, err
+            ))
+        })?;
         let tun_name = nic.tun_name.clone();
 
         self.state
