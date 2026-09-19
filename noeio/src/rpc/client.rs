@@ -2,7 +2,7 @@ use noeio_proto::proto::noeio::v1::daemon_service_client::DaemonServiceClient;
 use noeio_proto::proto::noeio::v1::virtual_nic_service_client::VirtualNicServiceClient;
 use noeio_proto::proto::noeio::v1::CreateVirtualNicRequest;
 use noeio_proto::proto::noeio::v1::network_service_client::NetworkServiceClient;
-use noeio_proto::proto::noeio::v1::{CreateNetworkRequest, ListNetworkRequest, NetCheckRequest};
+use noeio_proto::proto::noeio::v1::{CreateNetworkRequest, NetCheckRequest};
 use tonic::transport::Channel;
 use crate::rpc::outgoing;
 
@@ -38,25 +38,6 @@ impl CliRpcClient {
                 }
             }
         }
-        Ok(())
-    }
-
-    pub async fn list_networks(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let resp = self.network_client.list_networks(ListNetworkRequest {}).await?;
-        let networks = &resp.get_ref().networks;
-        if networks.is_empty() {
-            println!("No networks found.");
-        } else {
-            for net in networks {
-                println!("{}", net.name);
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn list_vnics(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: VirtualNicService 暂无 list 接口，待 proto 补充
-        println!("Not implemented yet.");
         Ok(())
     }
 

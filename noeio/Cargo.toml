@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 noeio-common = { workspace = true }
 noeio-proto = { workspace = true, features = ["noeio"] }
+noeio-net-route = { workspace = true }
 uuid = { workspace = true }
 tun = { workspace = true, features = ["async"] }
 tokio = { workspace = true, features = ["full"] }
@@ -30,4 +31,3 @@ async-trait = { workspace = true }
 # pnet links against Npcap's Packet.lib on Windows; only the Unix build uses it.
 [target.'cfg(unix)'.dependencies]
 pnet = { workspace = true }
-

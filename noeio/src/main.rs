@@ -1,11 +1,9 @@
 use clap::Parser;
-use noeio::cli::{Cli, Command, CreateResource, ListResource};
+use noeio::cli::{Cli, Command, CreateResource};
 use noeio::config::Config;
 use noeio::daemon::NoeioDaemon;
-use noeio::pkg::stun;
 use noeio::rpc::client::CliRpcClient;
 use noeio::rpc::service;
-use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -29,24 +27,6 @@ async fn main() {
             let state = NoeioDaemon::new(conn, cfg).await;
 
             service::run(state).await.expect("TODO: panic message");
-        }
-        Command::Stun => {
-            let factory = stun::StunClientFactory::new(Arc::new(
-                UdpSocket::bind("0.0.0.0:8080").await.unwrap(),
-            ));
-            let mut client = factory.create("").await.unwrap();
-            if let Ok(addr) = client.get_address().await {
-                println!("{}", addr);
-            }
-        }
-        Command::List { resource } => {
-            let mut client = CliRpcClient::new()
-                .await
-                .expect("failed to connect to daemon");
-            match resource {
-                ListResource::Network => client.list_networks().await.unwrap(),
-                ListResource::Vnic => client.list_vnics().await.unwrap(),
-            }
         }
         Command::Create { resource } => {
             let mut client = CliRpcClient::new()

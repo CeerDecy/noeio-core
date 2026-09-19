@@ -50,9 +50,10 @@ impl PeerManager {
                 .map_or(true, |(prev_addr, prev_info, prev_network)| {
                     prev_addr != addr || prev_info != info || prev_network != network
                 });
-        self.peers.insert(peer_id, (addr, info, network));
+        self.peers.insert(peer_id, (addr, info.clone(), network));
         self.by_addr.insert((addr, network), peer_id);
         if changed {
+            tracing::info!("handle notify one for peer_id {}, host info {:?}", peer_id, info);
             self.trigger.notify_one();
         }
     }

@@ -40,9 +40,15 @@ impl NetworkService for NetworkServiceImpl {
             .parse::<Ipv4Addr>()
             .map_err(|_| Status::invalid_argument(format!("invalid ip address: '{}'", req.ip)))?;
 
-        let name = req.name.clone();
-
-        let nic = VirtualNic::create_ipv4_nic(ip_addr).await;
+        // Nothing consumes the nic yet; the id is still a placeholder. Create
+        // it anyway so a bogus ip or a missing tun device surfaces here rather
+        // than silently succeeding.
+        VirtualNic::create_ipv4_nic(ip_addr).await.map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to create virtual nic for {}: {}",
+                req.ip, err
+            ))
+        })?;
 
         Ok(Response::from(CreateNetworkResponse {
             id: String::from(""),

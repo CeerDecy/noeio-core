@@ -1,9 +1,10 @@
 [workspace]
-members = ["noeio", "noeio-common", "noeio-derp", "noeio-proto"]
+members = ["noeio", "noeio-common", "noeio-derp", "noeio-proto", "noeio-net-route"]
 
 [workspace.dependencies]
 noeio-common = { path = "noeio-common" }
 noeio-proto = { path = "noeio-proto" }
+noeio-net-route = { path = "noeio-net-route" }
 axum = "0.8.8"
 tokio = { version = "1.49.0", features = ["full"] }
 boringtun = "0.7"
@@ -36,4 +37,3 @@ moka = { version = "0.12", features = ["sync"] }
 uuid = "1"
 async-trait = "0.1"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
-
