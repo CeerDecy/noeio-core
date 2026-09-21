@@ -1,0 +1,28 @@
+name: Version Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  version:
+    name: version.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # version.sh diffs version.txt against origin/main, so the shallow
+          # default checkout is not enough.
+          fetch-depth: 0
+
+      # On a pull request, require version.txt to have been bumped.
+      - name: Check versions are in sync and bumped
+        if: github.event_name == 'pull_request'
+        run: ./version.sh -c
+
+      # On main, version.txt is the baseline, so only check internal consistency.
+      - name: Check versions are in sync
+        if: github.event_name != 'pull_request'
+        run: ./version.sh -c -s
