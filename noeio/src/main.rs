@@ -41,15 +41,6 @@ async fn main() {
                 .await
                 .expect("failed to connect to daemon");
             match resource {
-                CreateResource::Network {
-                    name,
-                    ip,
-                    ip_version,
-                    cidr,
-                } => client
-                    .create_network(name, ip, ip_version, cidr)
-                    .await
-                    .unwrap(),
                 CreateResource::Vnic {
                     ip,
                     ip_version,

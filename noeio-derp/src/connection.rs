@@ -6,7 +6,6 @@ use noeio_common::packet::report::ReportPayload;
 use noeio_common::packet::{
     MAX_PACKET_LEN, NoeioPacket, NoeioPacketType, PacketHeader, PingPacketPayload,
 };
-use uuid::Uuid;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -14,6 +13,7 @@ use tokio::sync::Notify;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 pub mod peer;
 mod udp;
@@ -171,9 +171,7 @@ impl ConnectionManager {
                         // it (that would let a sender forge the sender stamp).
                         tracing::warn!(source = %addr, "dropping delivery packet sent to relay");
                     }
-                    NoeioPacketType::Seq
-                    | NoeioPacketType::Ack
-                    | NoeioPacketType::TunnelPong => {
+                    NoeioPacketType::Seq | NoeioPacketType::Ack | NoeioPacketType::TunnelPong => {
                         // Hole-punch and pong signalling is peer-to-peer;
                         // the relay does not act on it.
                     }
@@ -301,7 +299,7 @@ impl ConnectionManager {
                             }
 
                             let udp = udp.clone();
-                            let to_addr = addr.clone();
+                            let to_addr = *addr;
                             // Stamp the host-level path candidates into the
                             // broadcast entry: the STUN address and the LAN
                             // addresses. Receivers open a session per
@@ -321,11 +319,13 @@ impl ConnectionManager {
                                 .with_nat_addr(Some(info.nat_addr))
                                 .with_local_addrs(local_addrs);
                             let payload: Vec<u8> = (&info).into();
-                            let target_peer = target_id.clone();
+                            let target_peer = *target_id;
                             tokio::spawn(async move {
-                                let mut header = PacketHeader::default();
-                                header.packet_type = NoeioPacketType::SyncRoute;
-                                header.peer_id = target_peer;
+                                let header = PacketHeader{
+                                    packet_type:NoeioPacketType::SyncRoute,
+                                    peer_id : target_peer,
+                                    ..Default::default()
+                                };
 
                                 let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
 

@@ -8,9 +8,8 @@ pub type PeerId = u32;
 pub type NetworkId = [u8; 16];
 
 fn nat_type_from_proto(value: u32) -> Result<NatType, std::io::Error> {
-    let value = u8::try_from(value).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nat type")
-    })?;
+    let value = u8::try_from(value)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nat type"))?;
     NatType::try_from(value)
 }
 
@@ -221,11 +220,12 @@ impl TryFrom<&[u8]> for PeerInfo {
     type Error = std::io::Error;
 
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
-        if let Ok(proto) = ProtoPeerInfo::decode(data) {
-            if let Ok(peer) = Self::try_from(proto) {
-                return Ok(peer);
-            }
+        if let Ok(proto) = ProtoPeerInfo::decode(data)
+            && let Ok(peer) = Self::try_from(proto)
+        {
+            return Ok(peer);
         }
+
         let s = std::str::from_utf8(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         PeerInfo::try_from(s)
@@ -312,10 +312,10 @@ impl TryFrom<&[u8]> for HostInfo {
     type Error = std::io::Error;
 
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
-        if let Ok(proto) = ProtoHostInfo::decode(data) {
-            if let Ok(info) = Self::try_from_proto(proto) {
-                return Ok(info);
-            }
+        if let Ok(proto) = ProtoHostInfo::decode(data)
+            && let Ok(info) = Self::try_from_proto(proto)
+        {
+            return Ok(info);
         }
         Self::try_from_legacy(data)
     }

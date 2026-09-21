@@ -1,5 +1,5 @@
-use dashmap::DashSet;
 use crate::config;
+use dashmap::DashSet;
 
 pub struct StunManager {
     pub servers: DashSet<String>,

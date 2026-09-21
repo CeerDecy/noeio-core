@@ -181,7 +181,7 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
 
                     tracing::debug!("received outbound packet: {:?}", ip_bytes);
 
-                    if let Some(ipv4) = Ipv4Packet::new_checked(ip_bytes).ok() {
+                    if let Ok(ipv4) = Ipv4Packet::new_checked(ip_bytes) {
                         let dst_ip = IpAddr::from(ipv4.dst_addr());
 
                         let peer = match state.router.get(&dst_ip) {
@@ -277,7 +277,7 @@ fn register_host_info(daemon: Arc<NoeioDaemon>) {
                 continue;
             };
 
-            if daemon.nics.peers().len() <= 0 {
+            if daemon.nics.peers().is_empty() {
                 tracing::warn!("report skipped: no nic registered");
                 continue;
             }
@@ -446,49 +446,49 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                             // this peer's network (SyncRoute is
                                             // addressed to us); the session stamps
                                             // it into the signalling it sends.
-                                            let route_needed = match state.router.get(&peer.noeio_ip) {
-                                                Some(existing) => {
-                                                    let current_version =
-                                                        existing.info().resource_version;
-                                                    if peer.resource_version > current_version {
-                                                        state.router.update_info(
-                                                            &existing,
-                                                            peer.clone(),
-                                                            header.peer_id,
-                                                        );
-                                                        true
-                                                    } else {
-                                                        tracing::debug!(
-                                                            peer = %peer.peer_id,
-                                                            incoming = peer.resource_version,
-                                                            current = current_version,
-                                                            "skipping stale SyncRoute"
-                                                        );
-                                                        false
+                                            let route_needed =
+                                                match state.router.get(&peer.noeio_ip) {
+                                                    Some(existing) => {
+                                                        let current_version =
+                                                            existing.info().resource_version;
+                                                        if peer.resource_version > current_version {
+                                                            state.router.update_info(
+                                                                &existing,
+                                                                peer.clone(),
+                                                                header.peer_id,
+                                                            );
+                                                            true
+                                                        } else {
+                                                            tracing::debug!(
+                                                                peer = %peer.peer_id,
+                                                                incoming = peer.resource_version,
+                                                                current = current_version,
+                                                                "skipping stale SyncRoute"
+                                                            );
+                                                            false
+                                                        }
                                                     }
-                                                }
-                                                None => {
-                                                    state.router.insert(Peer::new(
-                                                        peer.clone(),
-                                                        state.udp.clone(),
-                                                        header.peer_id,
-                                                    ));
-                                                    true
-                                                }
-                                            };
-                                            if route_needed {
-                                                if let Err(err) = state
+                                                    None => {
+                                                        state.router.insert(Peer::new(
+                                                            peer.clone(),
+                                                            state.udp.clone(),
+                                                            header.peer_id,
+                                                        ));
+                                                        true
+                                                    }
+                                                };
+                                            if route_needed
+                                                && let Err(err) = state
                                                     .nics
                                                     .route(Some(header.peer_id), peer.noeio_ip)
                                                     .await
-                                                {
-                                                    tracing::error!(
-                                                        "Failed to route peer {} via local nic {}: {}",
-                                                        peer.noeio_ip,
-                                                        header.peer_id,
-                                                        err
-                                                    );
-                                                }
+                                            {
+                                                tracing::error!(
+                                                    "Failed to route peer {} via local nic {}: {}",
+                                                    peer.noeio_ip,
+                                                    header.peer_id,
+                                                    err
+                                                );
                                             }
                                         }
                                         Err(err) => {

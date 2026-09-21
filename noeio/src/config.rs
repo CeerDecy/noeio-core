@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Config {
@@ -13,10 +13,12 @@ impl Config {
     pub fn load(path: Option<PathBuf>) -> Self {
         let config = match path {
             Some(p) => {
-                let content = std::fs::read_to_string(&p)
-                    .unwrap_or_else(|e| panic!("failed to read config file '{}': {}", p.display(), e));
-                toml::from_str(&content)
-                    .unwrap_or_else(|e| panic!("failed to parse config file '{}': {}", p.display(), e))
+                let content = std::fs::read_to_string(&p).unwrap_or_else(|e| {
+                    panic!("failed to read config file '{}': {}", p.display(), e)
+                });
+                toml::from_str(&content).unwrap_or_else(|e| {
+                    panic!("failed to parse config file '{}': {}", p.display(), e)
+                })
             }
             None => {
                 let home = std::env::home_dir().expect("cannot determine home directory");
@@ -26,11 +28,13 @@ impl Config {
                 if !config_path.exists() {
                     std::fs::create_dir_all(&config_dir).expect("failed to create ~/.noeio");
                     let default_config = toml::to_string_pretty(&Config::default()).unwrap();
-                    std::fs::write(&config_path, &default_config).expect("failed to write config.toml");
+                    std::fs::write(&config_path, &default_config)
+                        .expect("failed to write config.toml");
                     return Config::default();
                 }
 
-                let content = std::fs::read_to_string(&config_path).expect("failed to read config.toml");
+                let content =
+                    std::fs::read_to_string(&config_path).expect("failed to read config.toml");
                 toml::from_str(&content).expect("failed to parse config.toml")
             }
         };
@@ -82,7 +86,12 @@ impl Config {
                 .map(|t| t.trim().to_string())
                 .unwrap_or_default();
 
-            match self.derper.servers.iter_mut().find(|s| s.address == address) {
+            match self
+                .derper
+                .servers
+                .iter_mut()
+                .find(|s| s.address == address)
+            {
                 // Already configured: only a non-empty flag token overrides the
                 // file, so `--derper-server` alone can't wipe a working token.
                 Some(existing) => {
@@ -97,8 +106,7 @@ impl Config {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct Noeio {
-}
+pub struct Noeio {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Derper {
@@ -191,7 +199,12 @@ mod tests {
             strs(&["tok-a"]),
         );
 
-        let tokens: Vec<&str> = cfg.derper.servers.iter().map(|s| s.token.as_str()).collect();
+        let tokens: Vec<&str> = cfg
+            .derper
+            .servers
+            .iter()
+            .map(|s| s.token.as_str())
+            .collect();
         assert_eq!(tokens, vec!["tok-a", "", ""]);
     }
 

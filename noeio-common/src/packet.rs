@@ -1,10 +1,10 @@
 pub mod report;
 mod token_frame;
 
+use crate::host_info::PeerId;
 use bytes::BytesMut;
 use smoltcp::wire::Ipv4Packet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use crate::host_info::PeerId;
 
 pub static MAX_PACKET_LEN: usize = 2048;
 
@@ -12,13 +12,13 @@ pub static MAX_PACKET_LEN: usize = 2048;
 pub enum NoeioPacketType {
     Ping,
     Forward,
-    SyncRoute,      //
-    Report,         // report host info
-    Seq,            // UDP hole punch request (initiator)
-    Ack,            // UDP hole punch response (acknowledgement)
-    TunnelPing,     // periodic liveness probe; keeps the NAT mapping open and carries the sender's send timestamp
-    TunnelPong,     // reply to TunnelPing echoing its timestamp, so the pinger can compute the tunnel RTT
-    Delivery,       // data packet from the peer named in the header; process locally, never forward
+    SyncRoute,  //
+    Report,     // report host info
+    Seq,        // UDP hole punch request (initiator)
+    Ack,        // UDP hole punch response (acknowledgement)
+    TunnelPing, // periodic liveness probe; keeps the NAT mapping open and carries the sender's send timestamp
+    TunnelPong, // reply to TunnelPing echoing its timestamp, so the pinger can compute the tunnel RTT
+    Delivery,   // data packet from the peer named in the header; process locally, never forward
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,13 +227,13 @@ impl NoeioPacket {
     pub fn src_ip(&self) -> Option<Ipv4Addr> {
         let payload = self.payload()?;
         let ipv4 = Ipv4Packet::new_checked(payload).ok()?;
-        Some(Ipv4Addr::from(ipv4.src_addr()))
+        Some(ipv4.src_addr())
     }
 
     pub fn dst_ip(&self) -> Option<Ipv4Addr> {
         let payload = self.payload()?;
         let ipv4 = Ipv4Packet::new_checked(payload).ok()?;
-        Some(Ipv4Addr::from(ipv4.dst_addr()))
+        Some(ipv4.dst_addr())
     }
 
     fn ensure_header(&mut self) {
@@ -324,7 +324,10 @@ mod delivery_tests {
             NoeioPacketType::TunnelPong,
             NoeioPacketType::Delivery,
         ] {
-            assert_eq!(NoeioPacketType::try_from(u8::from(packet_type)), Ok(packet_type));
+            assert_eq!(
+                NoeioPacketType::try_from(u8::from(packet_type)),
+                Ok(packet_type)
+            );
         }
     }
 

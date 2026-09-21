@@ -49,7 +49,10 @@ mod tests {
 
     #[test]
     fn to_bytes_and_try_from_roundtrip() {
-        let payload = ReportPayload::new("eyJhbGciOiJIUzI1NiJ9.e30.sig".to_string(), sample_host_info());
+        let payload = ReportPayload::new(
+            "eyJhbGciOiJIUzI1NiJ9.e30.sig".to_string(),
+            sample_host_info(),
+        );
 
         let bytes = payload.to_bytes();
         let parsed = ReportPayload::try_from(bytes.as_slice()).unwrap();

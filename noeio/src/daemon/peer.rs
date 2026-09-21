@@ -81,7 +81,11 @@ pub struct Peer {
 /// disambiguates our local session ids; boringtun keeps its low 24 bits).
 fn build_codec(info: &PeerInfo, local_peer_id: PeerId) -> Arc<dyn TunnelSession> {
     let (secret, peer_public) = derive_tunnel_keys(local_peer_id, info.peer_id, info.network_id);
-    Arc::new(WireGuardTunnelSession::new(secret, peer_public, info.peer_id))
+    Arc::new(WireGuardTunnelSession::new(
+        secret,
+        peer_public,
+        info.peer_id,
+    ))
 }
 
 impl Peer {
@@ -264,8 +268,7 @@ impl Peer {
 
         let mut selected = self.selected.lock().unwrap();
         // The incumbent, if it's still among the connected sessions.
-        let current =
-            selected.and_then(|addr| connected.iter().find(|(a, _)| *a == addr).copied());
+        let current = selected.and_then(|addr| connected.iter().find(|(a, _)| *a == addr).copied());
         // The challenger: lowest measured RTT; unmeasured sessions rank last.
         let best = connected
             .iter()
@@ -345,8 +348,8 @@ impl Peer {
     pub fn update_info(&self, info: PeerInfo, local_peer_id: PeerId) {
         let (identity_changed, keys_changed) = {
             let mut current = self.info.write().unwrap();
-            let identity_changed = current.network_id != info.network_id
-                || current.nat_type != info.nat_type;
+            let identity_changed =
+                current.network_id != info.network_id || current.nat_type != info.nat_type;
             // The codec's keys are derived from (network, peer id, our id); if
             // any of them changed, the old tunnel can no longer decrypt this
             // peer.

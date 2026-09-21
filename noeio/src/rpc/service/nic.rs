@@ -39,7 +39,7 @@ impl VirtualNicService for VirtualNicServiceImpl {
         self.state
             .register_nic(self.state.clone(), nic, reader, req.network_id.clone())
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
 
         Ok(Response::from(CreateVirtualNicResponse { tun_name }))
     }

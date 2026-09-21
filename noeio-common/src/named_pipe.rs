@@ -48,8 +48,7 @@ impl AsyncWrite for NamedPipeConnection {
 
 /// Future that owns the server instance while waiting for a client, then
 /// hands it back together with the connect result.
-type ConnectFuture =
-    Pin<Box<dyn Future<Output = (NamedPipeServer, std::io::Result<()>)> + Send>>;
+type ConnectFuture = Pin<Box<dyn Future<Output = (NamedPipeServer, std::io::Result<()>)> + Send>>;
 
 fn connect_future(server: NamedPipeServer) -> ConnectFuture {
     Box::pin(async move {
