@@ -33,23 +33,25 @@ Each node runs a noeio daemon that reports its addresses and NAT type to the sel
 
 ## Install
 
-Prerequisites: the [Rust toolchain](https://rustup.rs/) and `protoc` (the protobuf compiler) — `apt install protobuf-compiler` on Linux, `brew install protobuf` on macOS; on Windows use `choco install protoc` / `scoop install protobuf`, or download a `protoc-*-win64.zip` from the [protobuf releases](https://github.com/protocolbuffers/protobuf/releases) and add it to your `PATH`. Binaries are compiled locally by cargo, so this works on any platform.
-
-### derper
-
-The derper must be deployed on a machine reachable by every node — typically a cloud instance with a public IP:
-
-```bash
-cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
-```
-
 ### noeio
 
 Install the noeio daemon on every node that joins the virtual network:
 
 ```bash
-cargo install --git https://github.com/CeerDecy/noeio-core noeio
+curl --proto '=https' --tlsv1.2 -sSf https://noeio.net/install.sh | sh
 ```
+
+This installs a prebuilt binary, so no Rust toolchain is required. On Windows, or to build from source instead, see [Build](#build).
+
+### derper
+
+The derper must be deployed on a machine reachable by every node — typically a cloud instance with a public IP. The quickest way to run one is the Docker image shown in [Quick start](#quick-start); to install the binary from source instead:
+
+```bash
+cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
+```
+
+Building from source needs the [Rust toolchain](https://rustup.rs/) and `protoc` (the protobuf compiler) — `apt install protobuf-compiler` on Linux, `brew install protobuf` on macOS; on Windows use `choco install protoc` / `scoop install protobuf`, or download a `protoc-*-win64.zip` from the [protobuf releases](https://github.com/protocolbuffers/protobuf/releases) and add it to your `PATH`.
 
 ## Quick start
 
@@ -81,7 +83,25 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    noeio-derp token create --network 25fe8468-b310-43ed-96be-495641eececd --ttl 0
    ```
 
-3. On every node that should join the virtual network, update `~/.noeio/config.toml` (on Windows: `%USERPROFILE%\.noeio\config.toml`, e.g. `C:\Users\<username>\.noeio\config.toml`) — make sure to replace `address` with your own derper's address and `token` with the token created in step 2. You can use [`config.toml.example`](config.toml.example) in the project root as a reference:
+3. Install and start the noeio daemon on every node that should join the virtual network. Pass your derper address and the token from step 2 directly on the command line — replace `192.168.0.1:8080` with your own derper address, and pick a STUN server near you:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://noeio.net/install.sh | sh
+
+   noeio boot \
+     --stun stun.chat.bilibili.com:3478 \
+     --derper-server 192.168.0.1:8080 \
+     --derper-token <token from step 2>
+   ```
+
+   These flags are additive and per-run: they are merged into the configuration in memory and never modify your config file. See `noeio boot --help` for how to pass multiple STUN servers or derpers.
+
+   > Running the noeio daemon itself in Docker is not recommended on non-Linux hosts: virtual NIC creation differs per operating system, and the default Docker image ships the Linux flavor.
+
+   <details>
+   <summary>Prefer a config file? Configure it in <code>~/.noeio/config.toml</code> instead.</summary>
+
+   For a persistent setup, put the same values in `~/.noeio/config.toml` (on Windows: `%USERPROFILE%\.noeio\config.toml`, e.g. `C:\Users\<username>\.noeio\config.toml`) and run a bare `noeio boot`. Make sure to replace `address` with your own derper's address and `token` with the token created in step 2. You can use [`config.toml.example`](config.toml.example) in the project root as a reference:
 
    ```toml
    [stun]
@@ -92,15 +112,11 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    token = "<replace with the token from step 2>"
    ```
 
-4. Start the noeio daemon (binary only):
+   Add another `[[derper.servers]]` block per extra derper. A bare `noeio boot` creates this file with empty defaults on first run if it does not exist yet. The boot flags above still work alongside a config file: entries they add are appended to what the file already declares, and an address already present keeps its configured token unless the flag supplies a new one.
 
-   ```bash
-   noeio boot
-   ```
+   </details>
 
-   > Running the noeio daemon itself in Docker is not recommended on non-Linux hosts: virtual NIC creation differs per operating system, and the default Docker image ships the Linux flavor.
-
-5. Create a virtual NIC and join the network. `--ip` is up to you — the `100.64.0.0/10` range is recommended, and every node in the same network must use a different IP. `--network` must match the UUID used in step 2.
+4. Create a virtual NIC and join the network. `--ip` is up to you — the `100.64.0.0/10` range is recommended, and every node in the same network must use a different IP. `--network` must match the UUID used in step 2.
 
    On node A:
 
@@ -114,7 +130,7 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    noeio create vnic --ip 100.64.0.2 --network 25fe8468-b310-43ed-96be-495641eececd
    ```
 
-6. Try pinging node B from node A over the virtual network:
+5. Try pinging node B from node A over the virtual network:
 
    ```bash
    ping 100.64.0.2

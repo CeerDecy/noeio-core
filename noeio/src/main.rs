@@ -20,8 +20,16 @@ async fn main() {
         .try_init();
 
     match cli.command {
-        Command::Boot { config, port } => {
-            let cfg = Config::load(config);
+        Command::Boot {
+            config,
+            port,
+            stun,
+            derper_servers,
+            derper_tokens,
+        } => {
+            let mut cfg = Config::load(config);
+            cfg.append_stuns(stun);
+            cfg.append_derpers(derper_servers, derper_tokens);
 
             let conn = UdpSocket::bind(format!("0.0.0.0:{}", port)).await.unwrap();
             let state = NoeioDaemon::new(conn, cfg).await;
