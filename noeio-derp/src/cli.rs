@@ -113,7 +113,9 @@ pub fn parse_ttl(s: &str) -> Result<Duration, String> {
     }
 
     if s.chars().all(|c| c.is_ascii_digit()) {
-        let secs: u64 = s.parse().map_err(|e| format!("invalid duration '{}': {}", s, e))?;
+        let secs: u64 = s
+            .parse()
+            .map_err(|e| format!("invalid duration '{}': {}", s, e))?;
         return Ok(Duration::from_secs(secs));
     }
 
@@ -127,7 +129,12 @@ pub fn parse_ttl(s: &str) -> Result<Duration, String> {
         "m" => value * 60,
         "h" => value * 60 * 60,
         "d" => value * 60 * 60 * 24,
-        _ => return Err(format!("invalid duration unit '{}', expected s/m/h/d", unit)),
+        _ => {
+            return Err(format!(
+                "invalid duration unit '{}', expected s/m/h/d",
+                unit
+            ));
+        }
     };
     Ok(Duration::from_secs(secs))
 }

@@ -78,7 +78,7 @@ impl VirtualNic {
         #[cfg(not(target_os = "macos"))]
         config.tun_name("noeio0");
 
-        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+        #[cfg(target_os = "macos")]
         config.platform_config(|config| {
             config.packet_information(false);
         });

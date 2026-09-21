@@ -38,8 +38,7 @@ impl PeerManager {
             if info.resource_version <= prev_info.resource_version {
                 self.peers
                     .insert(peer_id, (prev_addr, prev_info, prev_network));
-                self.by_addr
-                    .insert((prev_addr, prev_network), peer_id);
+                self.by_addr.insert((prev_addr, prev_network), peer_id);
                 return;
             }
         }
@@ -47,17 +46,22 @@ impl PeerManager {
         let changed =
             self.peers
                 .get(&peer_id)
-                .map_or(true, |(prev_addr, prev_info, prev_network)| {
+                .is_none_or(|(prev_addr, prev_info, prev_network)| {
                     prev_addr != addr || prev_info != info || prev_network != network
                 });
         self.peers.insert(peer_id, (addr, info.clone(), network));
         self.by_addr.insert((addr, network), peer_id);
         if changed {
-            tracing::info!("handle notify one for peer_id {}, host info {:?}", peer_id, info);
+            tracing::info!(
+                "handle notify one for peer_id {}, host info {:?}",
+                peer_id,
+                info
+            );
             self.trigger.notify_one();
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_alive(&self, peer_id: &PeerId) -> bool {
         self.peers.contains_key(peer_id)
     }
@@ -66,6 +70,7 @@ impl PeerManager {
         self.peers.get(peer_id)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&self, peer_id: &PeerId) {
         if let Some((addr, _, network)) = self.peers.get(peer_id) {
             self.by_addr.invalidate(&(addr, network));

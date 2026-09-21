@@ -20,7 +20,9 @@ impl WireGuardConfig {
     /// peer id so that every host agrees on the same keys without a key
     /// exchange.
     pub fn new_from_network_peer(peer_id: String, network: &NetworkInfo) -> Self {
-        let network_str = Uuid::from_bytes(network.network_id).hyphenated().to_string();
+        let network_str = Uuid::from_bytes(network.network_id)
+            .hyphenated()
+            .to_string();
 
         let mut my_seed = [0u8; 32];
         generate_digest(&["self", &network_str, &peer_id], &mut my_seed);

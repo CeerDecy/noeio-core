@@ -9,7 +9,7 @@ fn collect_proto_files(dir: &Path) -> Vec<PathBuf> {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 proto_files.extend(collect_proto_files(&path));
-            } else if path.extension().map_or(false, |ext| ext == "proto") {
+            } else if path.extension().is_some_and(|ext| ext == "proto") {
                 proto_files.push(path);
             }
         }

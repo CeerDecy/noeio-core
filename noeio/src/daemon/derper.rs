@@ -75,7 +75,14 @@ impl DerperEntry {
             ));
         }
 
-        Self { info, addr, rtt_ms, last_ping_ts, pong_tx, _probe: tasks }
+        Self {
+            info,
+            addr,
+            rtt_ms,
+            last_ping_ts,
+            pong_tx,
+            _probe: tasks,
+        }
     }
 
     pub fn rtt(&self) -> Option<Duration> {
@@ -236,7 +243,15 @@ impl DerperManager {
             probe_done_rx,
         ));
 
-        Self { servers, by_addr, ordered, current, probe_done_tx, socket, _rank_task: rank_task }
+        Self {
+            servers,
+            by_addr,
+            ordered,
+            current,
+            probe_done_tx,
+            socket,
+            _rank_task: rank_task,
+        }
     }
 
     pub fn dispatch_pong(&self, addr: SocketAddr, echo_ts: u64) -> bool {
@@ -272,7 +287,12 @@ impl DerperManager {
 
     pub async fn append_derper_server(&self, server: DerperInfo) {
         let entry = Arc::new(
-            DerperEntry::new(server.clone(), self.socket.clone(), self.probe_done_tx.clone()).await,
+            DerperEntry::new(
+                server.clone(),
+                self.socket.clone(),
+                self.probe_done_tx.clone(),
+            )
+            .await,
         );
         if let Some(addr) = entry.addr {
             self.by_addr.insert(addr, entry.clone());
@@ -288,7 +308,10 @@ impl DerperManager {
         if let Some(addr) = entry.addr {
             self.by_addr.remove(&addr);
         }
-        self.ordered.write().await.retain(|e| e.info.address != address);
+        self.ordered
+            .write()
+            .await
+            .retain(|e| e.info.address != address);
         let _ = self.probe_done_tx.try_send(());
         true
     }
@@ -356,7 +379,10 @@ mod tests {
         }
 
         assert_eq!(rtt.load(Ordering::Acquire), U64_UNSET);
-        assert!(rx.try_recv().is_err(), "already-unset RTT is not re-signalled");
+        assert!(
+            rx.try_recv().is_err(),
+            "already-unset RTT is not re-signalled"
+        );
     }
 
     #[test]
@@ -427,7 +453,10 @@ mod tests {
         // A hostname that resolved: callers get the wire address alongside the
         // original config string, so reports reach it and the CLI can still
         // show what was configured.
-        let ok = entry_with_addr("derp.example.com:3478", Some("10.0.0.1:3478".parse().unwrap()));
+        let ok = entry_with_addr(
+            "derp.example.com:3478",
+            Some("10.0.0.1:3478".parse().unwrap()),
+        );
         let resolved = ok.resolved().expect("resolved entry yields a value");
         assert_eq!(resolved.address, "derp.example.com:3478");
         assert_eq!(resolved.token, "tok");
@@ -436,6 +465,10 @@ mod tests {
         // DNS failed: no wire address, so it must not reach a caller that is
         // about to send — this is what kept hostname derpers from getting
         // reports back when the report loop parsed the string itself.
-        assert!(entry_with_addr("broken.invalid:3478", None).resolved().is_none());
+        assert!(
+            entry_with_addr("broken.invalid:3478", None)
+                .resolved()
+                .is_none()
+        );
     }
 }

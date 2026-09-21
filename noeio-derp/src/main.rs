@@ -1,6 +1,6 @@
 use crate::cli::{Cli, Command, TokenCommand};
 use crate::connection::ConnectionManager;
-use crate::packet::PacketManager;
+
 use clap::Parser;
 use noeio_common::packet::NoeioPacket;
 use std::net::SocketAddr;
@@ -12,8 +12,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 mod cli;
 mod config;
 mod connection;
-mod packet;
-mod router;
 mod rpc;
 mod token;
 
@@ -75,7 +73,11 @@ async fn main() {
             // }
         }
         Command::Token { command } => match command {
-            TokenCommand::Create { network, ttl, output } => {
+            TokenCommand::Create {
+                network,
+                ttl,
+                output,
+            } => {
                 let ttl_seconds = match ttl {
                     None => None, // server default
                     Some(s) => match cli::parse_ttl(&s) {
@@ -90,7 +92,10 @@ async fn main() {
                 let mut client = match rpc::client::CliRpcClient::new().await {
                     Ok(client) => client,
                     Err(err) => {
-                        eprintln!("failed to connect to derper: {}\nHave you started the derper service?", err);
+                        eprintln!(
+                            "failed to connect to derper: {}\nHave you started the derper service?",
+                            err
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -112,7 +117,10 @@ async fn main() {
                 let mut client = match rpc::client::CliRpcClient::new().await {
                     Ok(client) => client,
                     Err(err) => {
-                        eprintln!("failed to connect to derper: {}\nHave you started the derper service?", err);
+                        eprintln!(
+                            "failed to connect to derper: {}\nHave you started the derper service?",
+                            err
+                        );
                         std::process::exit(1);
                     }
                 };

@@ -1,10 +1,9 @@
 use crate::interface::virtual_nic::VirtualNic;
 use dashmap::DashMap;
-use dashmap::mapref::one::RefMut;
 use noeio_common::host_info::PeerId;
 use std::net::IpAddr;
-use tun::DeviceWriter;
 
+#[derive(Default)]
 pub struct NicManager {
     nics: DashMap<PeerId, VirtualNic>,
 }

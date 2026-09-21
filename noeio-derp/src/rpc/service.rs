@@ -3,7 +3,7 @@ use crate::rpc::incoming;
 use crate::token;
 use noeio_proto::proto::derper::v1::token_service_server::{TokenService, TokenServiceServer};
 use noeio_proto::proto::derper::v1::{
-    CreateTokenRequest, CreateTokenResponse, VerifyTokenRequest, VerifyTokenResponse, TokenClaims,
+    CreateTokenRequest, CreateTokenResponse, TokenClaims, VerifyTokenRequest, VerifyTokenResponse,
 };
 use std::time::Duration;
 use tonic::transport::Server;
@@ -38,8 +38,8 @@ impl TokenService for TokenServiceImpl {
             Some(secs) => Some(Duration::from_secs(secs)),
         };
 
-        let (token, claims) = token::issue(&self.auth.secret, &req.network_id, ttl)
-            .map_err(|e| match e.kind() {
+        let (token, claims) =
+            token::issue(&self.auth.secret, &req.network_id, ttl).map_err(|e| match e.kind() {
                 std::io::ErrorKind::InvalidData => Status::invalid_argument(e.to_string()),
                 _ => Status::internal(e.to_string()),
             })?;

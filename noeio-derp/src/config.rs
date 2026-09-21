@@ -42,10 +42,12 @@ impl Config {
         });
 
         let mut config = if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("failed to read config file '{}': {}", path.display(), e));
-            toml::from_str(&content)
-                .unwrap_or_else(|e| panic!("failed to parse config file '{}': {}", path.display(), e))
+            let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("failed to read config file '{}': {}", path.display(), e)
+            });
+            toml::from_str(&content).unwrap_or_else(|e| {
+                panic!("failed to parse config file '{}': {}", path.display(), e)
+            })
         } else {
             Config::default()
         };
@@ -99,10 +101,8 @@ mod tests {
 
     #[test]
     fn parses_full_auth_section() {
-        let config: Config = toml::from_str(
-            "[auth]\nlocal = true\nsecret = \"deadbeef\"\n",
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str("[auth]\nlocal = true\nsecret = \"deadbeef\"\n").unwrap();
         assert!(config.auth.local);
         assert_eq!(config.auth.secret, "deadbeef");
     }

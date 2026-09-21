@@ -44,21 +44,6 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum CreateResource {
-    /// Create a new overlay network
-    Network {
-        /// Network name
-        #[arg(short, long)]
-        name: String,
-        /// IP address
-        #[arg(short, long)]
-        ip: String,
-        /// IP version (e.g. "v4", "v6")
-        #[arg(long, default_value = "v4")]
-        ip_version: String,
-        /// CIDR (e.g. "24")
-        #[arg(short, long)]
-        cidr: String,
-    },
     /// Create a new virtual NIC
     Vnic {
         /// IP address
