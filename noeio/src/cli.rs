@@ -19,6 +19,19 @@ pub enum Command {
         /// UDP listen port
         #[arg(short, long, default_value_t = 2026)]
         port: u16,
+        /// Extra STUN servers; pass several as a comma separated list, e.g.
+        /// --stun stun.a.example:3478,stun.b.example:3478
+        #[arg(long = "stun", value_delimiter = ',', value_name = "ADDR")]
+        stun: Vec<String>,
+        /// Extra derper servers; pass several as a comma separated list, e.g.
+        /// --derper-server derp.a.example:8080,derp.b.example:8080
+        #[arg(long = "derper-server", value_delimiter = ',', value_name = "ADDR")]
+        derper_servers: Vec<String>,
+        /// Report tokens, comma separated, paired positionally with
+        /// --derper-server so the first token belongs to the first derper.
+        /// Servers without a token report unauthenticated
+        #[arg(long = "derper-token", value_delimiter = ',', value_name = "TOKEN")]
+        derper_tokens: Vec<String>,
     },
     /// Check Derper relay server RTT latency
     Netcheck,

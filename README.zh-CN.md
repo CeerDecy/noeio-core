@@ -33,23 +33,25 @@ Noeio 是一个纯数据面组件：只负责组网本身，不内置 Tailscale 
 
 ## 安装
 
-前置条件：[Rust 工具链](https://rustup.rs/) 和 `protoc`（protobuf 编译器）——Linux 用 `apt install protobuf-compiler`，macOS 用 `brew install protobuf`；Windows 可用 `choco install protoc` / `scoop install protobuf`，或从 [protobuf releases](https://github.com/protocolbuffers/protobuf/releases) 下载 `protoc-*-win64.zip` 并加入 `PATH`。二进制由 cargo 在本机编译，因此任意平台均适用。
-
-### derper
-
-derper 需要部署在一台所有节点都能访问到的机器上，一般是一台带公网 IP 的云厂商机器：
-
-```bash
-cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
-```
-
 ### noeio
 
 在每个需要加入虚拟网络的节点上安装 noeio daemon：
 
 ```bash
-cargo install --git https://github.com/CeerDecy/noeio-core noeio
+curl --proto '=https' --tlsv1.2 -sSf https://noeio.net/install.sh | sh
 ```
+
+该方式安装的是预编译二进制，无需 Rust 工具链。Windows 用户，或希望从源码编译的，参见 [构建](#构建)。
+
+### derper
+
+derper 需要部署在一台所有节点都能访问到的机器上，一般是一台带公网 IP 的云厂商机器。最快的方式是使用 [快速开始](#快速开始) 中的 Docker 镜像；如需从源码安装二进制：
+
+```bash
+cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
+```
+
+从源码编译需要 [Rust 工具链](https://rustup.rs/) 和 `protoc`（protobuf 编译器）——Linux 用 `apt install protobuf-compiler`，macOS 用 `brew install protobuf`；Windows 可用 `choco install protoc` / `scoop install protobuf`，或从 [protobuf releases](https://github.com/protocolbuffers/protobuf/releases) 下载 `protoc-*-win64.zip` 并加入 `PATH`。
 
 ## 快速开始
 
@@ -81,7 +83,25 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    noeio-derp token create --network 25fe8468-b310-43ed-96be-495641eececd --ttl 0
    ```
 
-3. 在每个需要加入虚拟网络的节点上，更新 `~/.noeio/config.toml`——注意将 `address` 替换为你自己的 derper 地址，将 `token` 替换为第二步生成的 token。可以参考项目根目录下的 [`config.toml.example`](config.toml.example)：
+3. 在每个需要加入虚拟网络的节点上安装并启动 noeio daemon。直接在命令行传入 derper 地址和第二步生成的 token——将 `192.168.0.1:8080` 换成你自己的 derper 地址，STUN 服务器选一个离你较近的：
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://noeio.net/install.sh | sh
+
+   noeio boot \
+     --stun stun.chat.bilibili.com:3478 \
+     --derper-server 192.168.0.1:8080 \
+     --derper-token <第二步生成的 token>
+   ```
+
+   这些参数是追加式的，且仅对本次运行生效：它们只会合并进内存中的配置，不会修改你的配置文件。如需指定多个 STUN 服务器或多个 derper，参见 `noeio boot --help`。
+
+   > 非 Linux 宿主机不建议用 Docker 运行 noeio 本体：每个操作系统的虚拟网卡创建方式不同，默认 Docker 镜像提供的是 Linux 的部署。
+
+   <details>
+   <summary>更希望用配置文件？改为在 <code>~/.noeio/config.toml</code> 中配置。</summary>
+
+   如果需要持久化配置，可以把同样的内容写进 `~/.noeio/config.toml`（Windows 为 `%USERPROFILE%\.noeio\config.toml`，例如 `C:\Users\<用户名>\.noeio\config.toml`），然后直接执行 `noeio boot`。注意将 `address` 替换为你自己的 derper 地址，将 `token` 替换为第二步生成的 token。可以参考项目根目录下的 [`config.toml.example`](config.toml.example)：
 
    ```toml
    [stun]
@@ -92,15 +112,11 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    token = "<填入第二步生成的 token>"
    ```
 
-4. 启动 noeio daemon（仅提供二进制方式）：
+   每增加一个 derper 就追加一个 `[[derper.servers]]` 段。若该文件尚不存在，直接执行 `noeio boot` 会用空的默认值创建它。上面的命令行参数与配置文件可以共用：参数中的条目会追加到配置文件已声明的内容之后，而配置文件中已存在的地址会保留原有 token，除非参数提供了新的 token。
 
-   ```bash
-   noeio boot
-   ```
+   </details>
 
-   > 非 Linux 宿主机不建议用 Docker 运行 noeio 本体：每个操作系统的虚拟网卡创建方式不同，默认 Docker 镜像提供的是 Linux 的部署。
-
-5. 创建虚拟网卡并加入网络。`--ip` 可以自定义，建议使用 `100.64.0.0/10` 网段，同一个网络下每个节点的 IP 不能相同。`--network` 需要与第二步命令中的 network 参数保持一致。
+4. 创建虚拟网卡并加入网络。`--ip` 可以自定义，建议使用 `100.64.0.0/10` 网段，同一个网络下每个节点的 IP 不能相同。`--network` 需要与第二步命令中的 network 参数保持一致。
 
    节点 A 上执行：
 
@@ -114,7 +130,7 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio
    noeio create vnic --ip 100.64.0.2 --network 25fe8468-b310-43ed-96be-495641eececd
    ```
 
-6. 在节点 A 上通过虚拟网络 ping 节点 B：
+5. 在节点 A 上通过虚拟网络 ping 节点 B：
 
    ```bash
    ping 100.64.0.2
