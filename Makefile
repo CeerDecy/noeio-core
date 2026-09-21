@@ -1,5 +1,14 @@
 REGISTRY ?= noeio
-TAG ?= $(shell date +%Y%m%d%H%M)-$(shell git rev-parse --short=7 HEAD)
+
+# version.txt is the single source of truth, kept in sync by version.sh.
+VERSION ?= $(shell cat version.txt)
+BUILD_DATE ?= $(shell date +%Y%m%d%H%M)
+GIT_ID ?= $(shell git rev-parse --short=7 HEAD)
+
+# Set IS_LATEST=true to tag the image as `latest` instead of a versioned tag.
+IS_LATEST ?= false
+TAG ?= $(if $(filter true,$(IS_LATEST)),latest,v$(VERSION)-$(BUILD_DATE)-$(GIT_ID))
+
 PLATFORM ?= linux/amd64,linux/arm64
 PLATFORMS ?= linux-amd64 linux-arm64 macos-amd64 macos-aarch64 windows-amd64
 

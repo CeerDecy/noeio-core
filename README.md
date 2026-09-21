@@ -60,7 +60,7 @@ Building from source needs the [Rust toolchain](https://rustup.rs/) and `protoc`
    With Docker:
 
    ```bash
-   docker run -d --name noeio-derper -p 8080:8080/udp --rm registry.cn-hangzhou.aliyuncs.com/noeio/noeio-derp:202608112151-7b767cd
+   docker run -d --name noeio-derper -p 8080:8080/udp --rm noeio/noeio-derp:latest
    ```
 
    Or with the binary:
@@ -190,8 +190,6 @@ The lockfile used for the build is saved to `build/out/Cargo.lock`.
 Do not run concurrent builds sharing the same cache volume. Override `BUILD_IMAGE`
 or `BUILD_CACHE` as Make variables to change their names; see
 `./scripts/build-binaries.sh --help` for script details.
-If Docker Hub is unavailable, select a base image mirror, for example:
-`make binaries RUST_IMAGE=m.daocloud.io/docker.io/rust:1.94-bookworm`.
 The script produces binaries only; macOS signing/notarization and runtime components
 such as Windows TUN drivers are not included.
 

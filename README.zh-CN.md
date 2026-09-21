@@ -60,7 +60,7 @@ cargo install --git https://github.com/CeerDecy/noeio-core noeio-derp
    Docker 方式：
 
    ```bash
-   docker run -d --name noeio-derper -p 8080:8080/udp --rm registry.cn-hangzhou.aliyuncs.com/noeio/noeio-derp:202608112151-7b767cd
+   docker run -d --name noeio-derper -p 8080:8080/udp --rm noeio/noeio-derp:latest
    ```
 
    或二进制方式：
@@ -186,8 +186,6 @@ SDK 和项目源码只读挂载，编译工具安装在 Docker 镜像内，依�
 首次运行需要联网下载镜像和依赖，后续运行复用缓存。不要同时运行多个使用同一缓存卷的构建。
 存在 `Cargo.lock` 时复用它，否则在容器内生成；本次构建的锁文件保存到 `build/out/Cargo.lock`。
 可用 `BUILD_IMAGE`、`BUILD_CACHE` 指定镜像名和缓存卷名；这些变量可作为 `make` 参数传入；脚本选项见 `./scripts/build-binaries.sh --help`。
-如果 Docker Hub 无法访问，可指定基础镜像源，例如
-`make binaries RUST_IMAGE=m.daocloud.io/docker.io/rust:1.94-bookworm`。
 脚本仅生成二进制，不包含 macOS 签名/公证或 Windows TUN 驱动等运行时组件。
 
 ### 本机编译
