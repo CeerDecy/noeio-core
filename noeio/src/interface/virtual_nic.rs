@@ -12,6 +12,9 @@ use tun::{AbstractDevice, DeviceReader, DeviceWriter, Layer};
 /// our 9-byte envelope gives the same number.)
 pub const NIC_MTU: u16 = 1411;
 
+/// Metric for every route noeio installs through its TUN.
+pub const ROUTE_METRIC: u32 = 7;
+
 pub struct VirtualNic {
     pub writer: DeviceWriter,
     pub tun_name: String,
@@ -39,17 +42,22 @@ impl VirtualNic {
         ))
     }
 
-    pub async fn add_router_rule(
-        &self,
-        target: IpAddr,
-        netmask: &str,
-        hopcount: &str,
-    ) -> Result<(), Box<dyn Error>> {
-        let metric = hopcount
-            .parse::<u32>()
-            .map_err(|_| format!("invalid route metric: {hopcount}"))?;
-        noeio_net_route::add_route(target, netmask, self.tun_index, metric).await?;
-        Ok(())
+    /// Install `target/prefix` through this nic. An already-present identical
+    /// route counts as success.
+    pub async fn add_route(&self, target: IpAddr, prefix: u8) -> std::io::Result<()> {
+        match noeio_net_route::add_route(target, prefix, self.tun_index, ROUTE_METRIC).await {
+            Err(err) if noeio_net_route::is_route_exists(&err) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Remove `target/prefix` from this nic. A route that is already gone
+    /// counts as success.
+    pub async fn del_route(&self, target: IpAddr, prefix: u8) -> std::io::Result<()> {
+        match noeio_net_route::del_route(target, prefix, Some(self.tun_index)).await {
+            Err(err) if noeio_net_route::is_route_missing(&err) => Ok(()),
+            other => other,
+        }
     }
 
     fn create_tun(ip: Ipv4Addr) -> Result<tun::AsyncDevice, Box<dyn Error>> {
@@ -83,6 +91,13 @@ impl VirtualNic {
             config.packet_information(false);
         });
 
+        // The device must stay NON-persistent (IFF_PERSIST unset). Every route
+        // noeio installs has this interface as its egress; when the process
+        // dies — including SIGKILL — the kernel destroys the interface with
+        // the last fd and reclaims those routes with it. That is the only
+        // thing standing between an unclean exit and a black-holed subnet on a
+        // consumer node (see docs/subnet-router-requirements.md §12). Never
+        // set IFF_PERSIST or create the device with `ip tuntap add` here.
         Ok(tun::create_as_async(&config)?)
     }
 }

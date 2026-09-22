@@ -3,6 +3,14 @@ use dashmap::DashMap;
 use noeio_common::host_info::PeerId;
 use std::net::IpAddr;
 
+/// The local virtual nics, keyed by our own peer id in the network each nic
+/// joined.
+///
+/// This is a pure registry: it never touches the system routing table. Routes
+/// through these nics are owned by [`crate::daemon::reconciler`], which
+/// derives them from the router state and converges the kernel toward that —
+/// an imperative `add` here with no matching `del` is exactly how zombie
+/// routes came about.
 #[derive(Default)]
 pub struct NicManager {
     nics: DashMap<PeerId, VirtualNic>,
@@ -13,24 +21,6 @@ impl NicManager {
         Self {
             nics: DashMap::new(),
         }
-    }
-
-    pub async fn route(
-        &self,
-        id: Option<PeerId>,
-        target: IpAddr,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(id) = id {
-            let nic = match self.nics.get_mut(&id) {
-                None => return Err(format!("can't get nic for peer id: {}", id).into()),
-                Some(nic) => nic,
-            };
-            return nic.add_router_rule(target, "255.255.255.255", "7").await;
-        };
-        for nic in self.nics.iter_mut() {
-            nic.add_router_rule(target, "255.255.255.255", "7").await?;
-        }
-        Ok(())
     }
 
     pub fn register(&self, ip: PeerId, nic: VirtualNic) {
@@ -64,5 +54,14 @@ impl NicManager {
     /// interfaces out of the LAN addresses reported to the derper.
     pub fn ips(&self) -> Vec<IpAddr> {
         self.nics.iter().map(|entry| entry.value().ip).collect()
+    }
+
+    /// `(nic id, interface name)` of every registered nic — what the
+    /// reconciler needs to name a route's egress without holding a map guard.
+    pub fn interfaces(&self) -> Vec<(PeerId, String)> {
+        self.nics
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().tun_name.clone()))
+            .collect()
     }
 }

@@ -1,6 +1,7 @@
 pub mod derper;
 pub mod nic;
 pub mod peer;
+pub mod reconciler;
 pub mod router;
 pub mod stun;
 
@@ -9,6 +10,7 @@ use crate::config::Config;
 use crate::daemon::derper::DerperManager;
 use crate::daemon::nic::NicManager;
 use crate::daemon::peer::Peer;
+use crate::daemon::reconciler::{PeerRoutes, Reconciler, RouteKey};
 use crate::daemon::router::Router;
 use crate::daemon::stun::StunManager;
 use crate::interface::virtual_nic::VirtualNic;
@@ -49,6 +51,7 @@ pub struct NoeioDaemon {
     pub stun: StunManager,
     pub host_info: Mutex<Option<HostInfo>>,
     pub router: Router,
+    pub reconciler: Reconciler,
     pub task: JoinSet<()>,
 }
 
@@ -65,6 +68,7 @@ impl NoeioDaemon {
             config: cfg,
             host_info: Mutex::new(None),
             router: Router::new(),
+            reconciler: Reconciler::new(Some(reconciler::default_state_file())),
             task: JoinSet::new(),
         });
 
@@ -75,7 +79,79 @@ impl NoeioDaemon {
         register_host_info(daemon.clone());
 
         wg_timers(daemon.clone());
+
+        reconciler::spawn(daemon.clone());
         daemon
+    }
+
+    /// The routes every known peer contributes, as plain data for
+    /// [`reconciler::desired`].
+    pub fn route_snapshot(&self) -> Vec<PeerRoutes> {
+        self.router
+            .peers()
+            .into_iter()
+            .map(|peer| {
+                let info = peer.info();
+                PeerRoutes {
+                    nic: peer.local_peer_id(),
+                    peer_id: info.peer_id,
+                    ip: info.noeio_ip,
+                    subnets: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn ifindex_of(&self, nic: PeerId) -> Option<u32> {
+        self.nics.get(&nic).map(|nic| nic.tun_index)
+    }
+
+    /// One reconciler pass against the current router state.
+    pub async fn reconcile_routes(&self) -> usize {
+        let desired = reconciler::desired(&self.nics.peers(), &self.route_snapshot());
+        self.reconciler
+            .reconcile(&desired, |nic| self.ifindex_of(nic))
+            .await
+    }
+
+    /// Fold one `SyncRoute` into the router. `local_peer_id` is our own id in
+    /// the peer's network (the SyncRoute header addresses us). Returns whether
+    /// the router changed, i.e. whether the reconciler should run.
+    pub fn apply_sync_route(&self, peer: PeerInfo, local_peer_id: PeerId) -> bool {
+        match self.router.get(&peer.noeio_ip) {
+            Some(existing) => {
+                let current_version = existing.info().resource_version;
+                if peer.resource_version > current_version {
+                    self.router.update_info(&existing, peer, local_peer_id);
+                    true
+                } else {
+                    tracing::debug!(
+                        peer = %peer.peer_id,
+                        incoming = peer.resource_version,
+                        current = current_version,
+                        "skipping stale SyncRoute"
+                    );
+                    false
+                }
+            }
+            None => {
+                self.router
+                    .insert(Peer::new(peer, self.udp.clone(), local_peer_id));
+                true
+            }
+        }
+    }
+
+    /// Best-effort clean exit: remove every route we installed. The kernel
+    /// would reclaim them with the TUN anyway; doing it explicitly keeps the
+    /// state file truthful and covers platforms where that is unverified.
+    pub async fn shutdown(&self) {
+        let empty: std::collections::BTreeSet<RouteKey> = Default::default();
+        let removed = self
+            .reconciler
+            .reconcile(&empty, |nic| self.ifindex_of(nic))
+            .await;
+        tracing::info!(removed, "routes removed on shutdown");
     }
 
     pub async fn add_peer(&self, peer: host_info::PeerInfo) -> Result<(), &'static str> {
@@ -446,49 +522,11 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                             // this peer's network (SyncRoute is
                                             // addressed to us); the session stamps
                                             // it into the signalling it sends.
-                                            let route_needed =
-                                                match state.router.get(&peer.noeio_ip) {
-                                                    Some(existing) => {
-                                                        let current_version =
-                                                            existing.info().resource_version;
-                                                        if peer.resource_version > current_version {
-                                                            state.router.update_info(
-                                                                &existing,
-                                                                peer.clone(),
-                                                                header.peer_id,
-                                                            );
-                                                            true
-                                                        } else {
-                                                            tracing::debug!(
-                                                                peer = %peer.peer_id,
-                                                                incoming = peer.resource_version,
-                                                                current = current_version,
-                                                                "skipping stale SyncRoute"
-                                                            );
-                                                            false
-                                                        }
-                                                    }
-                                                    None => {
-                                                        state.router.insert(Peer::new(
-                                                            peer.clone(),
-                                                            state.udp.clone(),
-                                                            header.peer_id,
-                                                        ));
-                                                        true
-                                                    }
-                                                };
-                                            if route_needed
-                                                && let Err(err) = state
-                                                    .nics
-                                                    .route(Some(header.peer_id), peer.noeio_ip)
-                                                    .await
-                                            {
-                                                tracing::error!(
-                                                    "Failed to route peer {} via local nic {}: {}",
-                                                    peer.noeio_ip,
-                                                    header.peer_id,
-                                                    err
-                                                );
+                                            // Only the in-memory router changes here;
+                                            // the reconciler owns the kernel table
+                                            // and is woken to converge it.
+                                            if state.apply_sync_route(peer, header.peer_id) {
+                                                state.reconciler.notify();
                                             }
                                         }
                                         Err(err) => {
@@ -738,6 +776,7 @@ mod tests {
             stun: StunManager::from(crate::config::Stun::default()),
             host_info: Mutex::new(host_info),
             router: Router::new(),
+            reconciler: Reconciler::default(),
             task: JoinSet::new(),
         }
     }
@@ -748,6 +787,39 @@ mod tests {
         // is useless as a LAN candidate — nothing must be advertised.
         let derper = "127.0.0.1:3478".parse().unwrap();
         assert!(report_local_addrs(41641, derper, &[]).is_empty());
+    }
+
+    /// AC-14: a peer that stays silent after we learned it must keep its
+    /// routes. The derper dedupes reports by `resource_version`, so a healthy
+    /// peer with stable config produces *zero* SyncRoutes; a liveness rule
+    /// based on "time since last SyncRoute" would delete every healthy peer.
+    /// The desired set here is a pure function of the router and time never
+    /// enters it.
+    #[tokio::test(start_paused = true)]
+    async fn desired_routes_survive_a_silent_peer() {
+        let daemon = test_daemon(None).await;
+        let nic_id: PeerId = 7;
+        let peer = PeerInfo::new(
+            new_peer_id(),
+            IpAddr::V4(Ipv4Addr::new(110, 20, 0, 9)),
+            SAMPLE_NET,
+        )
+        .unwrap()
+        .with_resource_version(1);
+        assert!(daemon.apply_sync_route(peer.clone(), nic_id));
+
+        let before = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(before.len(), 1);
+
+        // Hours pass without a single SyncRoute for this peer.
+        tokio::time::advance(std::time::Duration::from_secs(6 * 3600)).await;
+
+        let after = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(before, after, "silence must not withdraw a route");
+
+        // And the duplicate report the derper would have deduped anyway is a
+        // no-op here as well.
+        assert!(!daemon.apply_sync_route(peer, nic_id));
     }
 
     #[tokio::test]

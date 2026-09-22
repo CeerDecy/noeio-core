@@ -4,6 +4,7 @@ use noeio::config::Config;
 use noeio::daemon::NoeioDaemon;
 use noeio::rpc::client::CliRpcClient;
 use noeio::rpc::service;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -34,7 +35,26 @@ async fn main() {
             let conn = UdpSocket::bind(format!("0.0.0.0:{}", port)).await.unwrap();
             let state = NoeioDaemon::new(conn, cfg).await;
 
-            service::run(state).await.expect("TODO: panic message");
+            // Serve until a shutdown signal, then converge the system back to
+            // its pre-boot state. This is the best-effort path (systemd stop,
+            // ctrl_c); SIGKILL and panics skip it, which is why the start-up
+            // sweep in the reconciler exists too.
+            tokio::select! {
+                res = service::run(state.clone()) => {
+                    if let Err(err) = res {
+                        tracing::error!("rpc service error: {}", err);
+                    }
+                }
+                _ = wait_for_shutdown_signal() => {
+                    tracing::info!("shutdown signal received, stopping noeio daemon");
+                }
+            }
+            if tokio::time::timeout(Duration::from_secs(5), state.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!("timed out cleaning up routes on shutdown");
+            }
         }
         Command::Create { resource } => {
             let mut client = CliRpcClient::new()
@@ -55,4 +75,28 @@ async fn main() {
             client.net_check().await.unwrap();
         }
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!("failed to register SIGTERM handler: {}", err);
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
