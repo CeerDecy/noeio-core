@@ -10,6 +10,13 @@ message PeerInfo {
   uint32 nat_type = 5;
   string nat_addr = 6;
   repeated string local_addrs = 7;
+  // Subnets (IPv4 CIDRs) this peer is a subnet router for. Peers that accept
+  // routes install these through their tunnel to this peer.
+  repeated string advertised_routes = 8;
+  // Set by the derper when it evicts this peer (report TTL expired): a
+  // tombstone. Receivers drop the peer and everything it contributed. Older
+  // receivers ignore the field and keep the peer until its own cleanup.
+  bool withdrawn = 9;
 }
 
 message HostInfo {

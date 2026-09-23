@@ -1,13 +1,26 @@
-//! Native routing-table operations used by noeio.
+//! Native routing-table and netfilter operations used by noeio.
 //!
 //! The public API takes the numeric interface index supplied by the TUN crate,
 //! so callers stay independent of platform-specific interface-name APIs and no
-//! `route`, `ip`, or `netsh` binary is needed at runtime.
+//! `route`, `ip`, `netsh`, `iptables`, or `nft` binary is needed at runtime.
+//! Routes go through the platform's native route API; on Linux, the
+//! subnet-router NAT rules go through nf_tables over netlink ([`nftables`]).
+//!
+//! Crate choices for netfilter, so nobody re-litigates them by accident:
+//! `rustables` is GPL-3.0 and cannot be linked into this Apache-2.0 project;
+//! `nftnl` needs `libnftnl` + `libmnl` at link time, which the musl cross
+//! build has no way to provide; the `nftables` and `iptables` crates shell
+//! out to binaries. `netlink-packet-netfilter` (MIT, pure Rust) is what's used.
 
 use std::{io, net::IpAddr};
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(target_os = "linux")]
+pub mod forwarding;
+#[cfg(target_os = "linux")]
+pub mod nftables;
 
 /// Add a route to `target/prefix` through the interface identified by
 /// `ifindex`. `metric` is the platform route metric where the native route API

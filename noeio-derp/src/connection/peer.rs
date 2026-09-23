@@ -1,11 +1,25 @@
+use moka::notification::RemovalCause;
 use moka::sync::Cache;
 use noeio_common::host_info::{HostInfo, NetworkId, PeerId};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 const HEARTBEAT_TTL: Duration = Duration::from_mins(1);
+
+/// A peer whose reports stopped: what we last knew about it. Broadcast to the
+/// rest of its network as a tombstone so consumers drop the routes it
+/// contributed — they cannot discover this themselves, because a dead peer
+/// sends no withdrawal and a healthy one with stable config sends nothing
+/// either (reports are deduplicated by `resource_version`).
+#[derive(Debug, Clone)]
+pub struct Gone {
+    pub peer_id: PeerId,
+    pub info: HostInfo,
+    pub network: NetworkId,
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerManager {
@@ -19,14 +33,51 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
-    pub fn new(trigger: Arc<Notify>) -> Self {
-        let peers = Cache::builder().time_to_live(HEARTBEAT_TTL).build();
-        let by_addr = Cache::builder().time_to_live(HEARTBEAT_TTL).build();
+    /// `gone` receives every peer the TTL expires. Expiry in moka is lazy —
+    /// it happens on access or on [`Self::sweep`], so the owner must call
+    /// `sweep` periodically for tombstones to be timely.
+    pub fn new(trigger: Arc<Notify>, gone: mpsc::UnboundedSender<Gone>) -> Self {
+        Self::with_ttl(trigger, gone, HEARTBEAT_TTL)
+    }
+
+    /// [`Self::new`] with an explicit liveness TTL (tests).
+    pub fn with_ttl(
+        trigger: Arc<Notify>,
+        gone: mpsc::UnboundedSender<Gone>,
+        ttl: Duration,
+    ) -> Self {
+        let peers = Cache::builder()
+            .time_to_live(ttl)
+            .eviction_listener(move |peer_id: Arc<PeerId>, value, cause| {
+                // `Replaced` is the heartbeat re-insert; `Size` can't happen
+                // (unbounded). Only a real disappearance is a tombstone.
+                if !matches!(cause, RemovalCause::Expired | RemovalCause::Explicit) {
+                    return;
+                }
+                let (_, info, network): (SocketAddr, HostInfo, NetworkId) = value;
+                // A closed receiver means the derper is shutting down; the
+                // listener must never panic, so the error is dropped.
+                let _ = gone.send(Gone {
+                    peer_id: *peer_id,
+                    info,
+                    network,
+                });
+            })
+            .build();
+        let by_addr = Cache::builder().time_to_live(ttl).build();
         PeerManager {
             peers,
             by_addr,
             trigger,
         }
+    }
+
+    /// Run moka's deferred maintenance so expired entries are actually
+    /// removed (and their eviction listener fires) even when nobody touches
+    /// them.
+    pub fn sweep(&self) {
+        self.peers.run_pending_tasks();
+        self.by_addr.run_pending_tasks();
     }
 
     pub fn heartbeat(&self, peer_id: PeerId, info: HostInfo, addr: SocketAddr, network: NetworkId) {
@@ -107,13 +158,14 @@ mod tests {
         format!("192.0.2.1:{port}").parse().unwrap()
     }
 
-    fn manager() -> PeerManager {
-        PeerManager::new(Arc::new(Notify::new()))
+    fn manager() -> (PeerManager, mpsc::UnboundedReceiver<Gone>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (PeerManager::new(Arc::new(Notify::new()), tx), rx)
     }
 
     #[test]
     fn resolves_sender_by_addr_scoped_to_network() {
-        let manager = manager();
+        let (manager, _) = manager();
         let net_a: NetworkId = [1u8; 16];
         let net_b: NetworkId = [2u8; 16];
         // The same host address holds one peer id per network it joined.
@@ -127,7 +179,7 @@ mod tests {
 
     #[test]
     fn stale_index_entry_is_rejected_after_peer_moves() {
-        let manager = manager();
+        let (manager, _) = manager();
         let net: NetworkId = [1u8; 16];
         manager.heartbeat(10, HostInfo::new(addr(1000)), addr(1000), net);
         // The peer re-registers from a new address; the old index entry
@@ -139,18 +191,66 @@ mod tests {
     }
 
     #[test]
-    fn removed_peer_is_no_longer_resolvable() {
-        let manager = manager();
+    fn removed_peer_is_no_longer_resolvable_and_is_a_tombstone() {
+        let (manager, mut gone) = manager();
         let net: NetworkId = [1u8; 16];
         manager.heartbeat(10, HostInfo::new(addr(1000)), addr(1000), net);
         manager.remove(&10);
+        manager.sweep();
 
         assert_eq!(manager.peer_id_by_addr(&addr(1000), &net), None);
+        let g = gone.try_recv().expect("explicit removal is a tombstone");
+        assert_eq!(g.peer_id, 10);
+        assert_eq!(g.network, net);
+    }
+
+    /// AC-6c, derper half: a peer whose reports stop is evicted by TTL and a
+    /// tombstone carrying its last HostInfo (hence its advertised routes) is
+    /// emitted; a peer that keeps reporting is not.
+    #[test]
+    fn ttl_expiry_emits_tombstone_with_last_host_info() {
+        let (tx, mut gone) = mpsc::unbounded_channel();
+        let manager = PeerManager::with_ttl(Arc::new(Notify::new()), tx, Duration::from_millis(50));
+        let net: NetworkId = [1u8; 16];
+        let mut info = HostInfo::new(addr(1000));
+        info.hostname = "advertiser".into();
+        manager.heartbeat(10, info, addr(1000), net);
+        manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
+
+        std::thread::sleep(Duration::from_millis(30));
+        // Peer 20 keeps reporting; a dedup re-insert refreshes its TTL.
+        manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
+        std::thread::sleep(Duration::from_millis(30));
+        manager.sweep();
+
+        let g = gone.try_recv().expect("expired peer must be tombstoned");
+        assert_eq!(g.peer_id, 10);
+        assert_eq!(g.info.hostname, "advertiser");
+        assert!(gone.try_recv().is_err(), "live peer must not be tombstoned");
+        assert!(manager.is_alive(&20));
+        assert!(!manager.is_alive(&10));
+    }
+
+    /// The heartbeat path re-inserts on every report; that is a `Replaced`,
+    /// not a disappearance, and must not produce a tombstone.
+    #[test]
+    fn heartbeat_reinserts_do_not_tombstone() {
+        let (manager, mut gone) = manager();
+        let net: NetworkId = [1u8; 16];
+        let mut info = HostInfo::new(addr(1000));
+        info.resource_version = 1;
+        manager.heartbeat(10, info.clone(), addr(1000), net);
+        // duplicate (dedup path re-insert) and newer (changed path)
+        manager.heartbeat(10, info.clone(), addr(1000), net);
+        info.resource_version = 2;
+        manager.heartbeat(10, info, addr(1000), net);
+        manager.sweep();
+        assert!(gone.try_recv().is_err());
     }
 
     #[test]
     fn stale_resource_version_does_not_replace_route() {
-        let manager = manager();
+        let (manager, _) = manager();
         let net: NetworkId = [1u8; 16];
         let mut current = HostInfo::new(addr(1000));
         current.resource_version = 20;
@@ -169,7 +269,7 @@ mod tests {
 
     #[test]
     fn equal_resource_version_does_not_replace_route() {
-        let manager = manager();
+        let (manager, _) = manager();
         let net: NetworkId = [1u8; 16];
         let mut current = HostInfo::new(addr(1000));
         current.resource_version = 20;

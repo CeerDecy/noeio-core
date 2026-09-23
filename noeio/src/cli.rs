@@ -32,6 +32,13 @@ pub enum Command {
         /// Servers without a token report unauthenticated
         #[arg(long = "derper-token", value_delimiter = ',', value_name = "TOKEN")]
         derper_tokens: Vec<String>,
+        /// Subnets this node routes for (subnet router role, Linux only);
+        /// comma separated CIDRs, e.g. --advertise-routes 192.168.10.0/24,172.20.0.0/16
+        #[arg(long = "advertise-routes", value_delimiter = ',', value_name = "CIDR")]
+        advertise_routes: Vec<String>,
+        /// Install subnet routes advertised by other nodes
+        #[arg(long = "accept-routes")]
+        accept_routes: bool,
     },
     /// Check Derper relay server RTT latency
     Netcheck,
@@ -40,6 +47,28 @@ pub enum Command {
         #[command(subcommand)]
         resource: CreateResource,
     },
+    /// Manage subnet routes on the running daemon
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RouteCommand {
+    /// Start routing for one or more subnets (Linux only), e.g.
+    /// noeio route advertise 192.168.10.0/24 172.20.0.0/16
+    Advertise {
+        #[arg(required = true, value_name = "CIDR")]
+        cidrs: Vec<String>,
+    },
+    /// Stop routing for one or more subnets
+    Withdraw {
+        #[arg(required = true, value_name = "CIDR")]
+        cidrs: Vec<String>,
+    },
+    /// Show advertised and learned subnet routes with their state
+    List,
 }
 
 #[derive(Subcommand, Debug)]

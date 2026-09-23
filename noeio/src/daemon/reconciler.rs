@@ -280,8 +280,12 @@ pub fn default_state_file() -> PathBuf {
 pub fn spawn(daemon: Arc<NoeioDaemon>) {
     tokio::spawn(async move {
         daemon.reconciler.restore().await;
+        // Netfilter and sysctl state outlive a crashed process; clear what a
+        // previous run left before applying anything (FR-8.8).
+        crate::daemon::nat::sweep_leftovers().await;
         loop {
             daemon.reconcile_routes().await;
+            crate::daemon::nat::converge(&daemon).await;
             tokio::select! {
                 _ = daemon.reconciler.notify.notified() => {}
                 _ = tokio::time::sleep(TICK) => {}

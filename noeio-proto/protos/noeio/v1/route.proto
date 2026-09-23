@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package noeio.v1;
+
+// Subnet-route management: what this node advertises, and what it has
+// learned from (and installed for) other nodes.
+service RouteService {
+  rpc AdvertiseRoute(AdvertiseRouteRequest) returns (AdvertiseRouteResponse);
+  rpc WithdrawRoute(WithdrawRouteRequest) returns (WithdrawRouteResponse);
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+}
+
+message AdvertiseRouteRequest {
+  // IPv4 CIDRs to add to this node's advertised set.
+  repeated string cidrs = 1;
+}
+
+message AdvertiseRouteResponse {
+  // The full advertised set after the change, normalized.
+  repeated string advertised = 1;
+}
+
+message WithdrawRouteRequest {
+  repeated string cidrs = 1;
+}
+
+message WithdrawRouteResponse {
+  repeated string advertised = 1;
+}
+
+message ListRoutesRequest {}
+
+enum RouteSource {
+  ROUTE_SOURCE_UNSPECIFIED = 0;
+  // Advertised by this node.
+  ROUTE_SOURCE_LOCAL = 1;
+  // Learned from another node.
+  ROUTE_SOURCE_REMOTE = 2;
+}
+
+enum RouteState {
+  ROUTE_STATE_UNSPECIFIED = 0;
+  // Installed and carrying traffic (or, for local, being advertised).
+  ROUTE_STATE_ACTIVE = 1;
+  // Learned but another peer is the active exit for this prefix.
+  ROUTE_STATE_STANDBY = 2;
+  // Learned but not installed; see reject_reason.
+  ROUTE_STATE_REJECTED = 3;
+}
+
+enum PathKind {
+  PATH_KIND_UNSPECIFIED = 0;
+  // No usable path to the peer right now.
+  PATH_KIND_NONE = 1;
+  PATH_KIND_DIRECT = 2;
+  PATH_KIND_RELAY = 3;
+}
+
+message RouteEntry {
+  string cidr = 1;
+  RouteSource source = 2;
+  // Remote only: the advertising peer.
+  uint32 peer_id = 3;
+  // Remote only: the peer's overlay address.
+  string via = 4;
+  RouteState state = 5;
+  string reject_reason = 6;
+  // Remote only: how traffic currently reaches the peer.
+  PathKind path = 7;
+  // Remote only, direct path: the address in use.
+  string path_addr = 8;
+}
+
+message ListRoutesResponse {
+  repeated RouteEntry routes = 1;
+  // Whether this build can act as a subnet router (advertise). False on
+  // macOS / Windows: the node is consumer-only.
+  bool can_advertise = 2;
+  string platform = 3;
+  bool accept_routes = 4;
+  // Advertiser only: whether forwarding + SNAT are currently applied.
+  bool nat_applied = 5;
+}
