@@ -204,31 +204,61 @@ mod tests {
         assert_eq!(g.network, net);
     }
 
-    /// AC-6c, derper half: a peer whose reports stop is evicted by TTL and a
-    /// tombstone carrying its last HostInfo (hence its advertised routes) is
-    /// emitted; a peer that keeps reporting is not.
+    /// AC-6c, derper half: a peer whose reports stop is evicted by TTL and the
+    /// tombstone carries its last HostInfo (hence its advertised routes).
+    ///
+    /// Only the expiring peer lives in the cache here. An earlier version kept
+    /// a second, live peer alongside it to assert that one was *not*
+    /// tombstoned, which required two sleeps to land on either side of a single
+    /// TTL: overshoot the first one and the live peer expires too — its
+    /// re-report puts it back in the cache, but the expiry has already queued a
+    /// tombstone, so `try_recv` returns peer 20 and the assertion reads
+    /// `left: 20, right: 10`. The refresh half is now
+    /// [`heartbeat_refresh_outlives_ttl`], where a late wake-up can only fail
+    /// the test, not invert it.
     #[test]
     fn ttl_expiry_emits_tombstone_with_last_host_info() {
         let (tx, mut gone) = mpsc::unbounded_channel();
-        let manager = PeerManager::with_ttl(Arc::new(Notify::new()), tx, Duration::from_millis(50));
+        let ttl = Duration::from_millis(50);
+        let manager = PeerManager::with_ttl(Arc::new(Notify::new()), tx, ttl);
         let net: NetworkId = [1u8; 16];
         let mut info = HostInfo::new(addr(1000));
         info.hostname = "advertiser".into();
         manager.heartbeat(10, info, addr(1000), net);
-        manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
 
-        std::thread::sleep(Duration::from_millis(30));
-        // Peer 20 keeps reporting; a dedup re-insert refreshes its TTL.
-        manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(ttl * 2);
         manager.sweep();
 
         let g = gone.try_recv().expect("expired peer must be tombstoned");
         assert_eq!(g.peer_id, 10);
+        assert_eq!(g.network, net);
         assert_eq!(g.info.hostname, "advertiser");
-        assert!(gone.try_recv().is_err(), "live peer must not be tombstoned");
-        assert!(manager.is_alive(&20));
         assert!(!manager.is_alive(&10));
+    }
+
+    /// The other half of AC-6c: a peer that keeps reporting is not evicted and
+    /// never tombstoned. Reports come at a fifth of the TTL and the run spans
+    /// more than one TTL, so passing means the refresh worked; a machine slow
+    /// enough to miss a deadline fails the test rather than silently asserting
+    /// something else.
+    #[test]
+    fn heartbeat_refresh_outlives_ttl() {
+        let (tx, mut gone) = mpsc::unbounded_channel();
+        let ttl = Duration::from_millis(100);
+        let manager = PeerManager::with_ttl(Arc::new(Notify::new()), tx, ttl);
+        let net: NetworkId = [1u8; 16];
+        manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
+
+        for _ in 0..6 {
+            std::thread::sleep(ttl / 5);
+            // A duplicate report takes the dedup path, which must still
+            // refresh liveness (see `heartbeat`).
+            manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
+        }
+        manager.sweep();
+
+        assert!(manager.is_alive(&20), "a reporting peer must not expire");
+        assert!(gone.try_recv().is_err(), "live peer must not be tombstoned");
     }
 
     /// The heartbeat path re-inserts on every report; that is a `Replaced`,
