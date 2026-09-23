@@ -1013,6 +1013,17 @@ mod tests {
         s.parse().unwrap()
     }
 
+    // Subnets for the consumer-side tests. `local_lans` enumerates the real
+    // interfaces, so the local-LAN rule (FR-3.4, highest priority) rejects
+    // anything overlapping an address this machine happens to hold — an RFC
+    // 1918 prefix here would pass on a `192.168.x` laptop and fail on a CI
+    // runner that sits on `10.x`. RFC 5737 documentation ranges are reserved
+    // for exactly this and are never assigned to an interface, which keeps
+    // these tests about the code under test rather than about the host.
+    // `local_lans` itself is covered in `routes::tests`.
+    const TEST_SUBNET: &str = "198.51.100.0/24";
+    const TEST_SUBNET_2: &str = "203.0.113.0/24";
+
     async fn accepting_daemon(host_info: Option<HostInfo>) -> NoeioDaemon {
         let mut d = test_daemon(host_info).await;
         d.config.router.accept_routes = true;
@@ -1030,7 +1041,7 @@ mod tests {
         let v1 = PeerInfo::new(id, ip, SAMPLE_NET)
             .unwrap()
             .with_resource_version(1)
-            .with_advertised_routes(vec![cidr("192.168.10.0/24"), cidr("172.20.0.0/16")]);
+            .with_advertised_routes(vec![cidr(TEST_SUBNET), cidr(TEST_SUBNET_2)]);
         assert!(daemon.apply_sync_route(v1, nic_id));
         daemon.refresh_subnets();
         let want = reconciler::desired(&[nic_id], &daemon.route_snapshot());
@@ -1038,29 +1049,29 @@ mod tests {
         assert!(
             daemon
                 .router
-                .lookup(&"172.20.1.1".parse().unwrap())
+                .lookup(&"203.0.113.1".parse().unwrap())
                 .is_some()
         );
 
         let v2 = PeerInfo::new(id, ip, SAMPLE_NET)
             .unwrap()
             .with_resource_version(2)
-            .with_advertised_routes(vec![cidr("192.168.10.0/24")]);
+            .with_advertised_routes(vec![cidr(TEST_SUBNET)]);
         assert!(daemon.apply_sync_route(v2, nic_id));
         daemon.refresh_subnets();
         let want = reconciler::desired(&[nic_id], &daemon.route_snapshot());
         assert_eq!(want.len(), 2);
-        assert!(!want.iter().any(|k| k.cidr == cidr("172.20.0.0/16")));
+        assert!(!want.iter().any(|k| k.cidr == cidr(TEST_SUBNET_2)));
         assert!(
             daemon
                 .router
-                .lookup(&"172.20.1.1".parse().unwrap())
+                .lookup(&"203.0.113.1".parse().unwrap())
                 .is_none()
         );
         assert!(
             daemon
                 .router
-                .lookup(&"192.168.10.7".parse().unwrap())
+                .lookup(&"198.51.100.7".parse().unwrap())
                 .is_some()
         );
     }
@@ -1076,7 +1087,7 @@ mod tests {
         let live = PeerInfo::new(id, ip, SAMPLE_NET)
             .unwrap()
             .with_resource_version(5)
-            .with_advertised_routes(vec![cidr("10.0.0.0/8")]);
+            .with_advertised_routes(vec![cidr(TEST_SUBNET)]);
         assert!(daemon.apply_sync_route(live.clone(), nic_id));
         daemon.refresh_subnets();
         assert_eq!(
