@@ -88,6 +88,7 @@ const NFTA_BYTEORDER_OP: u16 = 3;
 const NFTA_BYTEORDER_LEN: u16 = 4;
 const NFTA_BYTEORDER_SIZE: u16 = 5;
 const NFT_BYTEORDER_HTON: u32 = 1;
+#[allow(dead_code)]
 const NFTA_EXTHDR_DREG: u16 = 1;
 const NFTA_EXTHDR_TYPE: u16 = 2;
 const NFTA_EXTHDR_OFFSET: u16 = 3;
