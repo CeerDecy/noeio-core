@@ -153,6 +153,7 @@ impl PeerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn addr(port: u16) -> SocketAddr {
         format!("192.0.2.1:{port}").parse().unwrap()
@@ -237,26 +238,59 @@ mod tests {
     }
 
     /// The other half of AC-6c: a peer that keeps reporting is not evicted and
-    /// never tombstoned. Reports come at a fifth of the TTL and the run spans
-    /// more than one TTL, so passing means the refresh worked; a machine slow
-    /// enough to miss a deadline fails the test rather than silently asserting
-    /// something else.
+    /// never tombstoned. Reports take the dedup path in `heartbeat`, which
+    /// re-inserts the current value purely to refresh the liveness TTL; drop
+    /// that re-insert and an unchanged-but-reporting peer starts expiring.
+    ///
+    /// The report must be one cloned `HostInfo`, not a fresh
+    /// `HostInfo::new` per iteration: `new` stamps `resource_version` with
+    /// `now_version()`, so rebuilding it makes every report *newer* and takes
+    /// the unconditional insert below the dedup check. An earlier version of
+    /// this test did exactly that and so only asserted that a plain `insert`
+    /// refreshes a moka TTL, which moka guarantees; deleting the re-insert
+    /// under test left it passing.
+    ///
+    /// moka's clock cannot be mocked from outside the crate (`Mock` is
+    /// `pub(crate)` and `#[cfg(test)]`-gated), so liveness can only be observed
+    /// against the wall clock. The gaps between reports are therefore measured
+    /// rather than assumed: a stalled thread that lets a gap exceed the TTL has
+    /// legitimately expired the peer and proves nothing either way, so the run
+    /// is abandoned instead of reported as a refresh bug. Asserting on assumed
+    /// sleep durations is what made this test flaky on loaded CI runners.
     #[test]
     fn heartbeat_refresh_outlives_ttl() {
         let (tx, mut gone) = mpsc::unbounded_channel();
         let ttl = Duration::from_millis(100);
         let manager = PeerManager::with_ttl(Arc::new(Notify::new()), tx, ttl);
         let net: NetworkId = [1u8; 16];
-        manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
+        let info = HostInfo::new(addr(2000));
+        manager.heartbeat(20, info.clone(), addr(2000), net);
 
-        for _ in 0..6 {
-            std::thread::sleep(ttl / 5);
-            // A duplicate report takes the dedup path, which must still
-            // refresh liveness (see `heartbeat`).
-            manager.heartbeat(20, HostInfo::new(addr(2000)), addr(2000), net);
+        // Report an order of magnitude faster than the TTL, long enough to span
+        // several TTLs: only a working refresh can keep the peer alive that far.
+        let start = Instant::now();
+        let mut last_report = start;
+        let mut worst_gap = Duration::ZERO;
+        for _ in 0..30 {
+            std::thread::sleep(ttl / 10);
+            // Same resource version every time, so this is the dedup path.
+            manager.heartbeat(20, info.clone(), addr(2000), net);
+            let now = Instant::now();
+            worst_gap = worst_gap.max(now.duration_since(last_report));
+            last_report = now;
         }
+        let spanned = start.elapsed();
         manager.sweep();
 
+        if worst_gap >= ttl {
+            // The machine, not the cache, dropped the peer.
+            eprintln!("skipping: a {worst_gap:?} scheduling gap exceeded the {ttl:?} TTL");
+            return;
+        }
+        assert!(
+            spanned > ttl,
+            "the run must outlast one TTL to test anything, spanned {spanned:?}"
+        );
         assert!(manager.is_alive(&20), "a reporting peer must not expire");
         assert!(gone.try_recv().is_err(), "live peer must not be tombstoned");
     }
