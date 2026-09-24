@@ -8,3 +8,19 @@ token = ""
 [[derper.servers]]
 address = "192.168.0.2:8080"
 token = ""
+
+[router]
+# Subnets this node routes for (subnet router / advertiser role). Linux only:
+# on macOS and Windows a non-empty list is a start-up error. Prefix length
+# must be between /8 and /32; the overlay, derper, STUN, loopback and
+# link-local ranges are rejected.
+advertise_routes = []
+# Install subnet routes advertised by other nodes in the network.
+accept_routes = false
+# When advertising, also enable IP forwarding and SNAT for the advertised
+# subnets (rules live in a dedicated nftables table `noeio`). Set to false
+# to manage forwarding and NAT yourself.
+auto_nat = true
+# LAN-side interface used for SNAT. Leave empty to pick the interface the
+# system routes each advertised subnet through.
+lan_interface = ""

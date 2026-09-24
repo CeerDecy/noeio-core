@@ -1,5 +1,6 @@
 use noeio_proto::proto::common::v1::{HostInfo as ProtoHostInfo, PeerInfo as ProtoPeerInfo};
 use prost::Message;
+use smoltcp::wire::Ipv4Cidr;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -82,6 +83,14 @@ pub struct PeerInfo {
     /// daemon's UDP port. Broadcast alongside `nat_addr` so other peers can
     /// open a tunnel session per candidate and pick the lowest-RTT path.
     pub local_addrs: Vec<SocketAddr>,
+    /// Subnets this peer routes for (its `--advertise-routes`). Always in
+    /// network form (host bits cleared). Receivers that accept routes install
+    /// these through the tunnel to this peer, and accept inbound packets whose
+    /// inner source falls inside them.
+    pub advertised_routes: Vec<Ipv4Cidr>,
+    /// Tombstone: the derper evicted this peer (its reports stopped). Never
+    /// set by a peer about itself.
+    pub withdrawn: bool,
 }
 
 impl PeerInfo {
@@ -95,7 +104,19 @@ impl PeerInfo {
             nat_type: NatType::default(),
             nat_addr: None,
             local_addrs: Vec::new(),
+            advertised_routes: Vec::new(),
+            withdrawn: false,
         })
+    }
+
+    pub fn with_advertised_routes(mut self, routes: Vec<Ipv4Cidr>) -> Self {
+        self.advertised_routes = routes.into_iter().map(|c| c.network()).collect();
+        self
+    }
+
+    pub fn with_withdrawn(mut self, withdrawn: bool) -> Self {
+        self.withdrawn = withdrawn;
+        self
     }
 
     pub fn with_resource_version(mut self, resource_version: u64) -> Self {
@@ -246,6 +267,16 @@ pub struct HostInfo {
     pub peers: Vec<PeerInfo>,
 }
 
+/// A fresh, monotonically plausible `resource_version`: nanoseconds since the
+/// epoch. Anything that changes what a report says must move the version
+/// forward, or the derper will treat the report as a duplicate.
+pub fn now_version() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
 impl HostInfo {
     pub fn new(nat_addr: SocketAddr) -> Self {
         let hostname = hostname::get()
@@ -253,10 +284,7 @@ impl HostInfo {
             .to_string_lossy()
             .to_string();
         Self {
-            resource_version: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            resource_version: now_version(),
             nat_addr,
             nat_type: NatType::default(),
             hostname,
@@ -304,6 +332,12 @@ impl From<&PeerInfo> for ProtoPeerInfo {
                 .map(|addr| addr.to_string())
                 .unwrap_or_default(),
             local_addrs: peer.local_addrs.iter().map(ToString::to_string).collect(),
+            advertised_routes: peer
+                .advertised_routes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            withdrawn: peer.withdrawn,
         }
     }
 }
@@ -450,6 +484,20 @@ impl TryFrom<ProtoPeerInfo> for PeerInfo {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })
             .collect::<Result<Vec<SocketAddr>, _>>()?;
+        // A sender that predates subnet routing leaves the field empty
+        // (proto3 default) — no routes, not an error.
+        let advertised_routes = proto
+            .advertised_routes
+            .iter()
+            .map(|cidr| {
+                cidr.parse::<Ipv4Cidr>().map(|c| c.network()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid advertised route: {cidr}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             resource_version: proto.resource_version,
             peer_id: proto.peer_id,
@@ -458,6 +506,8 @@ impl TryFrom<ProtoPeerInfo> for PeerInfo {
             nat_type: nat_type_from_proto(proto.nat_type)?,
             nat_addr,
             local_addrs,
+            advertised_routes,
+            withdrawn: proto.withdrawn,
         })
     }
 }
@@ -679,6 +729,68 @@ mod tests {
         let protobuf_wire: Vec<u8> = (&info).into();
         let parsed = PeerInfo::try_from(protobuf_wire.as_slice()).unwrap();
         assert_eq!(parsed, info);
+    }
+
+    /// AC-8: advertised routes and the tombstone flag survive a protobuf
+    /// round trip, and host bits are normalized away on the way in.
+    #[test]
+    fn peer_info_roundtrips_advertised_routes_and_withdrawn() {
+        let info = PeerInfo::new(42, IpAddr::V4(Ipv4Addr::new(10, 64, 0, 2)), SAMPLE_NET_A)
+            .unwrap()
+            .with_advertised_routes(vec![
+                "192.168.10.7/24".parse().unwrap(),
+                "172.20.0.0/16".parse().unwrap(),
+            ])
+            .with_withdrawn(true);
+        assert_eq!(
+            info.advertised_routes,
+            vec![
+                "192.168.10.0/24".parse::<Ipv4Cidr>().unwrap(),
+                "172.20.0.0/16".parse().unwrap()
+            ]
+        );
+
+        let wire: Vec<u8> = (&info).into();
+        let parsed = PeerInfo::try_from(wire.as_slice()).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    /// AC-8: a message from a sender that predates the field parses with no
+    /// routes and no tombstone.
+    #[test]
+    fn peer_info_without_advertised_routes_field_parses_as_empty() {
+        let legacy = ProtoPeerInfo {
+            resource_version: 3,
+            peer_id: 42,
+            noeio_ip: vec![10, 64, 0, 2],
+            network_id: Uuid::parse_str(SAMPLE_NET_A).unwrap().into_bytes().to_vec(),
+            nat_type: 1,
+            nat_addr: String::new(),
+            local_addrs: Vec::new(),
+            ..Default::default()
+        };
+        let parsed = PeerInfo::try_from(legacy.encode_to_vec().as_slice()).unwrap();
+        assert!(parsed.advertised_routes.is_empty());
+        assert!(!parsed.withdrawn);
+
+        // The comma-separated legacy text format has no slot for the field
+        // either; it must keep parsing (and the fields default).
+        let entry = "42,10.64.0.2,550e8400-e29b-41d4-a716-446655440000,1,203.0.113.5:51820";
+        let parsed = PeerInfo::try_from(entry).unwrap();
+        assert!(parsed.advertised_routes.is_empty());
+    }
+
+    #[test]
+    fn peer_info_rejects_malformed_advertised_route() {
+        let bad = ProtoPeerInfo {
+            peer_id: 42,
+            noeio_ip: vec![10, 64, 0, 2],
+            network_id: Uuid::parse_str(SAMPLE_NET_A).unwrap().into_bytes().to_vec(),
+            nat_type: 1,
+            advertised_routes: vec!["not-a-cidr".to_string()],
+            ..Default::default()
+        };
+        assert!(PeerInfo::try_from(bad).is_err());
     }
 
     #[test]

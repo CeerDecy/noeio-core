@@ -13,6 +13,7 @@ Noeio is a self-hostable layer-3 mesh networking system with stateless, lightwei
 - **NAT traversal** — STUN-based address discovery and UDP hole punching for direct connections across NATs
 - **Lowest-latency path selection** — every candidate path (LAN and public) is probed with ping/pong RTT sampling, and traffic always takes the fastest one, with debounced switching
 - **Self-hosted relay fallback** — when no direct path exists, traffic falls back to your own derper relay, guarded by network-scoped token auth
+- **Subnet routing** — a Linux node can advertise LAN CIDRs and forward/SNAT for hosts that run no agent; every platform can accept them. See [docs/subnet-router.md](docs/subnet-router.md)
 - **Cross-platform** — runs on Linux, macOS, and Windows
 
 ## Motivation
@@ -216,7 +217,7 @@ cargo build --release -p noeio
 ## Roadmap
 
 - [ ] Zero-copy refactor of `NoeioPacket`
-- [ ] Subnet routing support
+- [x] Subnet routing support (Linux advertisers; see [docs/subnet-router.md](docs/subnet-router.md))
 - [ ] Multiple virtual network support
 
 ## License

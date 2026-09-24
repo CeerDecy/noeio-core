@@ -1,6 +1,6 @@
 [package]
 name = "noeio"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -31,3 +31,6 @@ async-trait = { workspace = true }
 # pnet links against Npcap's Packet.lib on Windows; only the Unix build uses it.
 [target.'cfg(unix)'.dependencies]
 pnet = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

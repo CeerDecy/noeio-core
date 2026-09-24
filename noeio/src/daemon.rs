@@ -1,7 +1,10 @@
 pub mod derper;
+pub mod nat;
 pub mod nic;
 pub mod peer;
+pub mod reconciler;
 pub mod router;
+pub mod routes;
 pub mod stun;
 
 use crate::common;
@@ -9,15 +12,19 @@ use crate::config::Config;
 use crate::daemon::derper::DerperManager;
 use crate::daemon::nic::NicManager;
 use crate::daemon::peer::Peer;
+use crate::daemon::reconciler::{PeerRoutes, Reconciler, RouteKey};
 use crate::daemon::router::Router;
+use crate::daemon::routes::{ConsumerPolicy, Decision, Protected};
 use crate::daemon::stun::StunManager;
 use crate::interface::virtual_nic::VirtualNic;
 use crate::tunnel::session::TunnOutput;
 use bytecodec::{DecodeExt, EncodeExt, Error as BytecodecError};
+use dashmap::DashMap;
 use noeio_common::host_info;
 use noeio_common::host_info::{HostInfo, NatType, PeerId, PeerInfo};
 use noeio_common::packet::report::ReportPayload;
 use noeio_common::packet::{NoeioPacket, NoeioPacketType, PacketHeader};
+use smoltcp::wire::Ipv4Cidr;
 use smoltcp::wire::Ipv4Packet;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
@@ -49,6 +56,22 @@ pub struct NoeioDaemon {
     pub stun: StunManager,
     pub host_info: Mutex<Option<HostInfo>>,
     pub router: Router,
+    pub reconciler: Reconciler,
+    /// Subnets this node advertises. Already validated (see
+    /// [`routes::validate_advertisement`]); on a consumer-only platform this
+    /// is always empty, which is what keeps such a node out of the broadcast
+    /// path. Behind a std lock: read on every report, written on config /
+    /// RPC changes only.
+    pub advertised: std::sync::RwLock<Vec<Ipv4Cidr>>,
+    /// Addresses no advertised CIDR may cover (derper / STUN), resolved at
+    /// boot. Used when validating runtime advertisements.
+    pub control_plane: Vec<IpAddr>,
+    /// The last consumer-side decisions, for `route list` (FR-7.4).
+    pub decisions: std::sync::RwLock<Vec<Decision>>,
+    /// Packets dropped by the AllowedIPs check, per source peer (O-3).
+    pub allowed_ips_drops: DashMap<PeerId, u64>,
+    /// Forwarding / SNAT currently applied on this (Linux) advertiser.
+    pub nat_state: std::sync::Mutex<nat::NatState>,
     pub task: JoinSet<()>,
 }
 
@@ -57,6 +80,15 @@ impl NoeioDaemon {
         let udp = Arc::new(udp);
         let derper = DerperManager::new(cfg.derper.clone(), udp.clone()).await;
         let stun = StunManager::from(cfg.stun.clone());
+        let control_plane = routes::resolve_control_plane(&cfg).await;
+        // `main` has already validated and normalized these; a parse failure
+        // here would be a bug, not user input.
+        let advertised: Vec<Ipv4Cidr> = cfg
+            .router
+            .advertise_routes
+            .iter()
+            .filter_map(|c| c.parse().ok())
+            .collect();
         let daemon = Arc::new(Self {
             nics: NicManager::new(),
             udp,
@@ -65,6 +97,12 @@ impl NoeioDaemon {
             config: cfg,
             host_info: Mutex::new(None),
             router: Router::new(),
+            reconciler: Reconciler::new(Some(reconciler::default_state_file())),
+            advertised: std::sync::RwLock::new(advertised),
+            control_plane,
+            decisions: Default::default(),
+            allowed_ips_drops: DashMap::new(),
+            nat_state: Default::default(),
             task: JoinSet::new(),
         });
 
@@ -75,7 +113,213 @@ impl NoeioDaemon {
         register_host_info(daemon.clone());
 
         wg_timers(daemon.clone());
+
+        reconciler::spawn(daemon.clone());
         daemon
+    }
+
+    /// Subnets this node currently advertises.
+    pub fn advertised_routes(&self) -> Vec<Ipv4Cidr> {
+        self.advertised.read().unwrap().clone()
+    }
+
+    /// Replace the advertised set (already validated by the caller) and make
+    /// the change visible: every local `PeerInfo` gets the new list and
+    /// `HostInfo.resource_version` is bumped, because the derper dedupes
+    /// reports by that version and would otherwise drop the update on the
+    /// floor (FR-1.6). Also re-runs the consumer decisions, since what we
+    /// advertise ourselves is one of their inputs.
+    pub async fn set_advertised(&self, routes: Vec<Ipv4Cidr>) {
+        {
+            let mut current = self.advertised.write().unwrap();
+            if *current == routes {
+                return;
+            }
+            *current = routes.clone();
+        }
+        tracing::info!(routes = ?routes, "advertised routes updated");
+        if let Some(host) = self.host_info.lock().await.as_mut() {
+            for peer in &mut host.peers {
+                peer.advertised_routes = routes.clone();
+            }
+            host.resource_version = host_info::now_version().max(host.resource_version + 1);
+        }
+        self.reconciler.notify();
+    }
+
+    /// The consumer-side policy for [`routes::decide`], from config plus what
+    /// this node itself advertises and where its physical interfaces are.
+    fn consumer_policy(&self) -> ConsumerPolicy {
+        let overlay_ips = self.nics.ips();
+        ConsumerPolicy {
+            accept_routes: self.config.router.accept_routes,
+            local_lans: routes::local_lans(&overlay_ips),
+            self_advertised: self.advertised_routes(),
+            protected: Protected {
+                overlay_ips,
+                control_plane: self.control_plane.clone(),
+            },
+        }
+    }
+
+    /// Re-run the consumer decisions over every peer's advertisements and
+    /// refresh the router's subnet table with the accepted ones. Called on
+    /// every router change before the reconciler runs, so the LPM table used
+    /// by `process_outbound` and the kernel routes always come from the same
+    /// decision. Logs each newly rejected advertisement (FR-2.6).
+    pub fn refresh_subnets(&self) {
+        let peers = self.router.peers();
+        let mut advertised: Vec<(PeerId, Ipv4Cidr)> = Vec::new();
+        for peer in &peers {
+            let info = peer.info();
+            for cidr in info.advertised_routes {
+                advertised.push((info.peer_id, cidr));
+            }
+        }
+        let decisions = routes::decide(&self.consumer_policy(), &advertised);
+
+        let previous = self.decisions.read().unwrap().clone();
+        for d in &decisions {
+            let was = previous
+                .iter()
+                .find(|p| p.peer_id == d.peer_id && p.cidr == d.cidr)
+                .map(|p| p.rejected);
+            if was != Some(d.rejected) {
+                match d.rejected {
+                    None => {
+                        tracing::info!(peer_id = d.peer_id, cidr = %d.cidr, "subnet route accepted")
+                    }
+                    Some(why) => {
+                        tracing::warn!(peer_id = d.peer_id, cidr = %d.cidr, %why, "subnet route rejected")
+                    }
+                }
+            }
+        }
+        for p in &previous {
+            if !decisions
+                .iter()
+                .any(|d| d.peer_id == p.peer_id && d.cidr == p.cidr)
+            {
+                tracing::info!(peer_id = p.peer_id, cidr = %p.cidr, "subnet route withdrawn");
+            }
+        }
+
+        let accepted: Vec<(Ipv4Cidr, PeerId)> = decisions
+            .iter()
+            .filter(|d| d.rejected.is_none())
+            .map(|d| (d.cidr, d.peer_id))
+            .collect();
+        self.router.set_subnets(accepted);
+        *self.decisions.write().unwrap() = decisions;
+    }
+
+    /// The routes every known peer contributes, as plain data for
+    /// [`reconciler::desired`]. Subnets come from the router's accepted table
+    /// (see [`Self::refresh_subnets`]), so a withdrawn or rejected route is
+    /// simply not in the snapshot and the reconciler deletes it (FR-2.5).
+    pub fn route_snapshot(&self) -> Vec<PeerRoutes> {
+        let subnets = self.router.subnets();
+        self.router
+            .peers()
+            .into_iter()
+            .map(|peer| {
+                let info = peer.info();
+                PeerRoutes {
+                    nic: peer.local_peer_id(),
+                    peer_id: info.peer_id,
+                    ip: info.noeio_ip,
+                    subnets: subnets
+                        .iter()
+                        .filter(|(_, exit)| *exit == info.peer_id)
+                        .map(|(cidr, _)| *cidr)
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    fn ifindex_of(&self, nic: PeerId) -> Option<u32> {
+        self.nics.get(&nic).map(|nic| nic.tun_index)
+    }
+
+    /// One reconciler pass against the current router state.
+    pub async fn reconcile_routes(&self) -> usize {
+        self.refresh_subnets();
+        let desired = reconciler::desired(&self.nics.peers(), &self.route_snapshot());
+        self.reconciler
+            .reconcile(&desired, |nic| self.ifindex_of(nic))
+            .await
+    }
+
+    /// Fold one `SyncRoute` into the router. `local_peer_id` is our own id in
+    /// the peer's network (the SyncRoute header addresses us). Returns whether
+    /// the router changed, i.e. whether the reconciler should run.
+    pub fn apply_sync_route(&self, peer: PeerInfo, local_peer_id: PeerId) -> bool {
+        if peer.withdrawn {
+            // Tombstone from the derper: the peer's reports stopped. Drop it
+            // and everything it contributed; the reconciler removes the
+            // routes. This is the only liveness signal we act on — silence
+            // alone never is (FR-8.6).
+            return match self.router.remove_by_peer_id(&peer.peer_id) {
+                Some(_) => {
+                    tracing::info!(
+                        peer_id = peer.peer_id,
+                        ip = %peer.noeio_ip,
+                        resource_version = peer.resource_version,
+                        "peer withdrawn by derper"
+                    );
+                    true
+                }
+                None => false,
+            };
+        }
+        match self.router.get(&peer.noeio_ip) {
+            Some(existing) => {
+                let current_version = existing.info().resource_version;
+                if peer.resource_version > current_version {
+                    let previous = existing.info().advertised_routes;
+                    if previous != peer.advertised_routes {
+                        tracing::info!(
+                            peer_id = peer.peer_id,
+                            resource_version = peer.resource_version,
+                            routes = ?peer.advertised_routes,
+                            "peer advertised routes changed"
+                        );
+                    }
+                    self.router.update_info(&existing, peer, local_peer_id);
+                    true
+                } else {
+                    tracing::debug!(
+                        peer = %peer.peer_id,
+                        incoming = peer.resource_version,
+                        current = current_version,
+                        "skipping stale SyncRoute"
+                    );
+                    false
+                }
+            }
+            None => {
+                self.router
+                    .insert(Peer::new(peer, self.udp.clone(), local_peer_id));
+                true
+            }
+        }
+    }
+
+    /// Best-effort clean exit: remove every route we installed. The kernel
+    /// would reclaim them with the TUN anyway; doing it explicitly keeps the
+    /// state file truthful and covers platforms where that is unverified.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let empty: std::collections::BTreeSet<RouteKey> = Default::default();
+        let removed = self
+            .reconciler
+            .reconcile(&empty, |nic| self.ifindex_of(nic))
+            .await;
+        tracing::info!(removed, "routes removed on shutdown");
+        // Forwarding and the nftables table do not die with the process, so
+        // this is the one place they get removed on a clean exit.
+        self.advertised.write().unwrap().clear();
+        nat::converge(self).await;
     }
 
     pub async fn add_peer(&self, peer: host_info::PeerInfo) -> Result<(), &'static str> {
@@ -103,11 +347,15 @@ impl NoeioDaemon {
     ) -> Result<(), String> {
         let peer_id = host_info::new_peer_id();
         let peer = host_info::PeerInfo::new(peer_id, nic.ip, &network)
-            .map_err(|err| format!("failed to create peer: {}", err))?;
+            .map_err(|err| format!("failed to create peer: {}", err))?
+            .with_advertised_routes(self.advertised_routes());
 
         tracing::info!(peer_id = %peer_id, "creating virtual nic {}", nic.ip);
 
         self.nics.register(peer_id, nic);
+        // A new nic is an egress for routes (and, on an advertiser, the TUN
+        // the NAT rules name); converge right away rather than on the tick.
+        self.reconciler.notify();
         self.add_peer(peer).await?;
         process_outbound(state, reader);
         Ok(())
@@ -184,13 +432,13 @@ pub fn process_outbound(state: Arc<NoeioDaemon>, mut reader: DeviceReader) {
                     if let Ok(ipv4) = Ipv4Packet::new_checked(ip_bytes) {
                         let dst_ip = IpAddr::from(ipv4.dst_addr());
 
-                        let peer = match state.router.get(&dst_ip) {
+                        // Exact host route first, then longest accepted
+                        // subnet prefix. A miss is routine with subnet routes
+                        // (broadcasts, scans of a covered range that we
+                        // don't route), so it is not an error.
+                        let peer = match state.router.lookup(&dst_ip) {
                             None => {
-                                tracing::error!(
-                                    "no router found for {}, known routes: {:?}",
-                                    dst_ip,
-                                    state.router.ips()
-                                );
+                                tracing::debug!(%dst_ip, "no route for outbound packet");
                                 continue;
                             }
                             Some(peer) => peer,
@@ -446,49 +694,11 @@ pub fn process_inbound(state: Arc<NoeioDaemon>) {
                                             // this peer's network (SyncRoute is
                                             // addressed to us); the session stamps
                                             // it into the signalling it sends.
-                                            let route_needed =
-                                                match state.router.get(&peer.noeio_ip) {
-                                                    Some(existing) => {
-                                                        let current_version =
-                                                            existing.info().resource_version;
-                                                        if peer.resource_version > current_version {
-                                                            state.router.update_info(
-                                                                &existing,
-                                                                peer.clone(),
-                                                                header.peer_id,
-                                                            );
-                                                            true
-                                                        } else {
-                                                            tracing::debug!(
-                                                                peer = %peer.peer_id,
-                                                                incoming = peer.resource_version,
-                                                                current = current_version,
-                                                                "skipping stale SyncRoute"
-                                                            );
-                                                            false
-                                                        }
-                                                    }
-                                                    None => {
-                                                        state.router.insert(Peer::new(
-                                                            peer.clone(),
-                                                            state.udp.clone(),
-                                                            header.peer_id,
-                                                        ));
-                                                        true
-                                                    }
-                                                };
-                                            if route_needed
-                                                && let Err(err) = state
-                                                    .nics
-                                                    .route(Some(header.peer_id), peer.noeio_ip)
-                                                    .await
-                                            {
-                                                tracing::error!(
-                                                    "Failed to route peer {} via local nic {}: {}",
-                                                    peer.noeio_ip,
-                                                    header.peer_id,
-                                                    err
-                                                );
+                                            // Only the in-memory router changes here;
+                                            // the reconciler owns the kernel table
+                                            // and is woken to converge it.
+                                            if state.apply_sync_route(peer, header.peer_id) {
+                                                state.reconciler.notify();
                                             }
                                         }
                                         Err(err) => {
@@ -588,16 +798,26 @@ async fn handle_delivery(state: &Arc<NoeioDaemon>, peer: &Peer, payload: &[u8], 
         let mut buf = [0u8; WG_BUFFER_SIZE];
         match codec.decapsulate(Some(src.ip()), input, &mut buf) {
             TunnOutput::ToNic(plaintext, inner_src) => {
-                // Anti-spoofing: the decrypted packet must claim the virtual
-                // IP of the peer whose session decrypted it.
+                // Anti-spoofing with WireGuard AllowedIPs semantics: the
+                // decrypted packet must come from the peer's own virtual IP
+                // or from inside a subnet the peer advertises (a subnet
+                // router forwards replies that carry the LAN host's address).
+                // Anything else is dropped. Counted per peer and logged only
+                // on the first drop and every 1000th after that, so one
+                // misconfigured peer can't flood the log.
                 if let Some(ip) = inner_src
-                    && ip != info.noeio_ip
+                    && !Router::allowed_source(&info, ip)
                 {
-                    tracing::warn!(
-                        peer_id = info.peer_id,
-                        %ip,
-                        "dropping packet: inner source doesn't match peer"
-                    );
+                    let mut count = state.allowed_ips_drops.entry(info.peer_id).or_insert(0);
+                    *count += 1;
+                    if *count == 1 || count.is_multiple_of(1000) {
+                        tracing::warn!(
+                            peer_id = info.peer_id,
+                            %ip,
+                            dropped = *count,
+                            "dropping packet: inner source not in peer's allowed IPs"
+                        );
+                    }
                     break;
                 }
                 write_to_nic(state, peer.local_peer_id(), plaintext).await;
@@ -738,6 +958,12 @@ mod tests {
             stun: StunManager::from(crate::config::Stun::default()),
             host_info: Mutex::new(host_info),
             router: Router::new(),
+            reconciler: Reconciler::default(),
+            advertised: Default::default(),
+            control_plane: Vec::new(),
+            decisions: Default::default(),
+            allowed_ips_drops: DashMap::new(),
+            nat_state: Default::default(),
             task: JoinSet::new(),
         }
     }
@@ -748,6 +974,229 @@ mod tests {
         // is useless as a LAN candidate — nothing must be advertised.
         let derper = "127.0.0.1:3478".parse().unwrap();
         assert!(report_local_addrs(41641, derper, &[]).is_empty());
+    }
+
+    /// AC-14: a peer that stays silent after we learned it must keep its
+    /// routes. The derper dedupes reports by `resource_version`, so a healthy
+    /// peer with stable config produces *zero* SyncRoutes; a liveness rule
+    /// based on "time since last SyncRoute" would delete every healthy peer.
+    /// The desired set here is a pure function of the router and time never
+    /// enters it.
+    #[tokio::test(start_paused = true)]
+    async fn desired_routes_survive_a_silent_peer() {
+        let daemon = test_daemon(None).await;
+        let nic_id: PeerId = 7;
+        let peer = PeerInfo::new(
+            new_peer_id(),
+            IpAddr::V4(Ipv4Addr::new(110, 20, 0, 9)),
+            SAMPLE_NET,
+        )
+        .unwrap()
+        .with_resource_version(1);
+        assert!(daemon.apply_sync_route(peer.clone(), nic_id));
+
+        let before = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(before.len(), 1);
+
+        // Hours pass without a single SyncRoute for this peer.
+        tokio::time::advance(std::time::Duration::from_secs(6 * 3600)).await;
+
+        let after = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(before, after, "silence must not withdraw a route");
+
+        // And the duplicate report the derper would have deduped anyway is a
+        // no-op here as well.
+        assert!(!daemon.apply_sync_route(peer, nic_id));
+    }
+
+    fn cidr(s: &str) -> Ipv4Cidr {
+        s.parse().unwrap()
+    }
+
+    // Subnets for the consumer-side tests. `local_lans` enumerates the real
+    // interfaces, so the local-LAN rule (FR-3.4, highest priority) rejects
+    // anything overlapping an address this machine happens to hold — an RFC
+    // 1918 prefix here would pass on a `192.168.x` laptop and fail on a CI
+    // runner that sits on `10.x`. RFC 5737 documentation ranges are reserved
+    // for exactly this and are never assigned to an interface, which keeps
+    // these tests about the code under test rather than about the host.
+    // `local_lans` itself is covered in `routes::tests`.
+    const TEST_SUBNET: &str = "198.51.100.0/24";
+    const TEST_SUBNET_2: &str = "203.0.113.0/24";
+
+    async fn accepting_daemon(host_info: Option<HostInfo>) -> NoeioDaemon {
+        let mut d = test_daemon(host_info).await;
+        d.config.router.accept_routes = true;
+        d
+    }
+
+    /// FR-2.5: a newer PeerInfo without a CIDR withdraws it — the desired
+    /// set is recomputed from the full list, not patched incrementally.
+    #[tokio::test]
+    async fn newer_peer_info_withdraws_missing_subnets() {
+        let daemon = accepting_daemon(None).await;
+        let nic_id: PeerId = 7;
+        let id = new_peer_id();
+        let ip = IpAddr::V4(Ipv4Addr::new(110, 20, 0, 1));
+        let v1 = PeerInfo::new(id, ip, SAMPLE_NET)
+            .unwrap()
+            .with_resource_version(1)
+            .with_advertised_routes(vec![cidr(TEST_SUBNET), cidr(TEST_SUBNET_2)]);
+        assert!(daemon.apply_sync_route(v1, nic_id));
+        daemon.refresh_subnets();
+        let want = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(want.len(), 3);
+        assert!(
+            daemon
+                .router
+                .lookup(&"203.0.113.1".parse().unwrap())
+                .is_some()
+        );
+
+        let v2 = PeerInfo::new(id, ip, SAMPLE_NET)
+            .unwrap()
+            .with_resource_version(2)
+            .with_advertised_routes(vec![cidr(TEST_SUBNET)]);
+        assert!(daemon.apply_sync_route(v2, nic_id));
+        daemon.refresh_subnets();
+        let want = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(want.len(), 2);
+        assert!(!want.iter().any(|k| k.cidr == cidr(TEST_SUBNET_2)));
+        assert!(
+            daemon
+                .router
+                .lookup(&"203.0.113.1".parse().unwrap())
+                .is_none()
+        );
+        assert!(
+            daemon
+                .router
+                .lookup(&"198.51.100.7".parse().unwrap())
+                .is_some()
+        );
+    }
+
+    /// FR-8.5 layer 2: a tombstone removes the peer and every route it
+    /// contributed; a stale tombstone for an unknown peer is a no-op.
+    #[tokio::test]
+    async fn tombstone_removes_peer_and_its_subnets() {
+        let daemon = accepting_daemon(None).await;
+        let nic_id: PeerId = 7;
+        let id = new_peer_id();
+        let ip = IpAddr::V4(Ipv4Addr::new(110, 20, 0, 1));
+        let live = PeerInfo::new(id, ip, SAMPLE_NET)
+            .unwrap()
+            .with_resource_version(5)
+            .with_advertised_routes(vec![cidr(TEST_SUBNET)]);
+        assert!(daemon.apply_sync_route(live.clone(), nic_id));
+        daemon.refresh_subnets();
+        assert_eq!(
+            reconciler::desired(&[nic_id], &daemon.route_snapshot()).len(),
+            2
+        );
+
+        let tombstone = live.clone().with_withdrawn(true);
+        assert!(daemon.apply_sync_route(tombstone.clone(), nic_id));
+        daemon.refresh_subnets();
+        assert!(reconciler::desired(&[nic_id], &daemon.route_snapshot()).is_empty());
+        assert!(daemon.router.get_by_peer_id(&id).is_none());
+        assert!(!daemon.apply_sync_route(tombstone, nic_id));
+
+        // The peer coming back is a fresh insert, not a stale-version skip.
+        assert!(daemon.apply_sync_route(live.with_resource_version(1), nic_id));
+    }
+
+    /// accept_routes = false (C-2 / AC-12): advertisements are learned but
+    /// nothing is installed and lookup never resolves through them.
+    #[tokio::test]
+    async fn accept_routes_off_installs_no_subnets() {
+        let daemon = test_daemon(None).await;
+        let nic_id: PeerId = 7;
+        let peer = PeerInfo::new(
+            new_peer_id(),
+            IpAddr::V4(Ipv4Addr::new(110, 20, 0, 1)),
+            SAMPLE_NET,
+        )
+        .unwrap()
+        .with_resource_version(1)
+        .with_advertised_routes(vec![cidr("10.0.0.0/8")]);
+        assert!(daemon.apply_sync_route(peer, nic_id));
+        daemon.refresh_subnets();
+        let want = reconciler::desired(&[nic_id], &daemon.route_snapshot());
+        assert_eq!(want.len(), 1, "only the /32 host route");
+        assert!(daemon.router.lookup(&"10.1.2.3".parse().unwrap()).is_none());
+        let decisions = daemon.decisions.read().unwrap().clone();
+        assert_eq!(decisions[0].rejected, Some(routes::Rejection::PolicyOff));
+    }
+
+    /// FR-1.6: changing what we advertise bumps HostInfo.resource_version and
+    /// updates every local PeerInfo, or the derper would dedupe the report.
+    #[tokio::test]
+    async fn set_advertised_bumps_version_and_updates_peers() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 51820);
+        let daemon = test_daemon(Some(HostInfo::new(addr))).await;
+        daemon
+            .add_peer(
+                PeerInfo::new(
+                    new_peer_id(),
+                    IpAddr::V4(Ipv4Addr::new(110, 20, 0, 1)),
+                    SAMPLE_NET,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before = daemon
+            .host_info
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .resource_version;
+
+        daemon.set_advertised(vec![cidr("192.168.10.0/24")]).await;
+        let host = daemon.host_info.lock().await.clone().unwrap();
+        assert!(host.resource_version > before);
+        assert_eq!(
+            host.peers[0].advertised_routes,
+            vec![cidr("192.168.10.0/24")]
+        );
+
+        // Unchanged set: no bump.
+        daemon.set_advertised(vec![cidr("192.168.10.0/24")]).await;
+        assert_eq!(
+            daemon
+                .host_info
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .resource_version,
+            host.resource_version
+        );
+    }
+
+    /// AC-16 (3): what a node advertises is exactly what passed the gate; a
+    /// consumer-only platform therefore never puts a CIDR into PeerInfo.
+    #[tokio::test]
+    async fn advertised_routes_only_enter_peer_info_through_the_gate() {
+        let mut cfg = Config::default();
+        cfg.router.advertise_routes = vec!["192.168.10.0/24".to_string()];
+        let accepted = cfg.validate_routes(&routes::Protected::default());
+        let advertised: Vec<Ipv4Cidr> = accepted.unwrap_or_default();
+        if routes::platform_can_advertise() {
+            assert_eq!(advertised, vec![cidr("192.168.10.0/24")]);
+        } else {
+            assert!(advertised.is_empty());
+        }
+        let peer = PeerInfo::new(
+            new_peer_id(),
+            IpAddr::V4(Ipv4Addr::new(110, 20, 0, 1)),
+            SAMPLE_NET,
+        )
+        .unwrap()
+        .with_advertised_routes(advertised.clone());
+        assert_eq!(peer.advertised_routes, advertised);
     }
 
     #[tokio::test]

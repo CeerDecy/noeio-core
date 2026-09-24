@@ -1,22 +1,26 @@
 use crate::config::Config;
-use crate::connection::peer::PeerManager;
+use crate::connection::peer::{Gone, PeerManager};
 use crate::token;
-use noeio_common::host_info::NetworkId;
+use noeio_common::host_info::{NetworkId, PeerId, PeerInfo};
 use noeio_common::packet::report::ReportPayload;
 use noeio_common::packet::{
     MAX_PACKET_LEN, NoeioPacket, NoeioPacketType, PacketHeader, PingPacketPayload,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 use tokio::sync::broadcast::{Receiver, Sender};
-use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 pub mod peer;
 mod udp;
+
+/// How often expired peers are swept out of the cache. Bounds the delay
+/// between a peer's TTL running out and its tombstone going out.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct ConnectionManager {
     peer_manager: Arc<PeerManager>,
@@ -40,9 +44,10 @@ impl ConnectionManager {
         let task: JoinSet<()> = JoinSet::new();
 
         let trigger = Arc::new(Notify::new());
+        let (gone_tx, gone_rx) = mpsc::unbounded_channel();
 
         let mut manager = ConnectionManager {
-            peer_manager: Arc::new(PeerManager::new(trigger.clone())),
+            peer_manager: Arc::new(PeerManager::new(trigger.clone(), gone_tx)),
             socket: udp,
             sender,
             shutdown,
@@ -53,8 +58,69 @@ impl ConnectionManager {
         manager.handle_connect();
         manager.handle_packet_recv(reader);
         manager.handle_sync(trigger);
+        manager.handle_gone(gone_rx);
+        manager.handle_sweep();
 
         manager
+    }
+
+    /// Drive moka's lazy expiry so a peer whose reports stopped is evicted
+    /// (and its tombstone sent) within one sweep interval of its TTL, rather
+    /// than whenever something next happens to touch the cache.
+    fn handle_sweep(&mut self) {
+        let manager = self.peer_manager.clone();
+        let mut shutdown = self.shutdown.clone();
+        self.task.spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tick.tick() => manager.sweep(),
+                }
+            }
+        });
+    }
+
+    /// Broadcast a tombstone for every peer the TTL evicts: the same
+    /// `SyncRoute` the live path sends, with `withdrawn = true`, to every
+    /// still-alive member of the dead peer's network. Receivers drop the peer
+    /// and the routes it advertised; older receivers ignore the flag and keep
+    /// the peer, which is what they did before.
+    fn handle_gone(&mut self, mut gone: mpsc::UnboundedReceiver<Gone>) {
+        let manager = self.peer_manager.clone();
+        let udp = self.socket.clone();
+        self.task.spawn(async move {
+            while let Some(dead) = gone.recv().await {
+                let targets: Vec<(PeerId, SocketAddr)> = manager
+                    .alive_peers()
+                    .into_iter()
+                    .filter(|(id, (_, _, network))| *id != dead.peer_id && *network == dead.network)
+                    .map(|(id, (addr, _, _))| (id, addr))
+                    .collect();
+                for peer_info in dead.info.peers {
+                    if peer_info.network_id != dead.network {
+                        continue;
+                    }
+                    let tombstone = peer_info
+                        .with_resource_version(dead.info.resource_version)
+                        .with_withdrawn(true);
+                    tracing::info!(
+                        peer_id = tombstone.peer_id,
+                        ip = %tombstone.noeio_ip,
+                        routes = ?tombstone.advertised_routes,
+                        targets = targets.len(),
+                        "peer expired, broadcasting tombstone"
+                    );
+                    for &(target, addr) in &targets {
+                        send_sync_route(&udp, target, addr, &tombstone).await;
+                    }
+                }
+            }
+        });
     }
 
     fn handle_connect(&mut self) {
@@ -307,6 +373,8 @@ impl ConnectionManager {
                             // from the peer entry itself; the host-level list
                             // is a fallback for senders that predate per-peer
                             // local_addrs (HostInfo.local_addrs is deprecated).
+                            // Advertised routes ride along untouched: the
+                            // derper is a transparent relay for them (FR-2.4).
                             let local_addrs = if peer_info.local_addrs.is_empty() {
                                 info.local_addrs.clone()
                             } else {
@@ -318,21 +386,9 @@ impl ConnectionManager {
                                 .with_nat_type(info.nat_type)
                                 .with_nat_addr(Some(info.nat_addr))
                                 .with_local_addrs(local_addrs);
-                            let payload: Vec<u8> = (&info).into();
                             let target_peer = *target_id;
                             tokio::spawn(async move {
-                                let header = PacketHeader{
-                                    packet_type:NoeioPacketType::SyncRoute,
-                                    peer_id : target_peer,
-                                    ..Default::default()
-                                };
-
-                                let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
-
-                                if let Err(err) = udp.send_to(packet.as_slice(), to_addr).await {
-                                    tracing::error!("failed to send sync route: {}", err);
-                                }
-                                tracing::info!(target_peer = %target_peer, "sent sync route to {}, peer info {:?}", to_addr,info);
+                                send_sync_route(&udp, target_peer, to_addr, &info).await;
                             });
                         }
                     }
@@ -340,6 +396,22 @@ impl ConnectionManager {
             }
         });
     }
+}
+
+/// Send one `SyncRoute` carrying `info` to `target` at `to_addr`. The header
+/// names the *receiver's* id in the network so it can resolve its own nic.
+async fn send_sync_route(udp: &UdpSocket, target: PeerId, to_addr: SocketAddr, info: &PeerInfo) {
+    let header = PacketHeader {
+        packet_type: NoeioPacketType::SyncRoute,
+        peer_id: target,
+        ..Default::default()
+    };
+    let payload: Vec<u8> = info.into();
+    let packet: Vec<u8> = NoeioPacket::new(header, &payload).into();
+    if let Err(err) = udp.send_to(packet.as_slice(), to_addr).await {
+        tracing::error!("failed to send sync route: {}", err);
+    }
+    tracing::info!(target_peer = %target, withdrawn = info.withdrawn, "sent sync route to {}, peer info {:?}", to_addr, info);
 }
 
 async fn handle_udp_recv(

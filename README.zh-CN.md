@@ -13,6 +13,7 @@ Noeio 是一个可私有化部署、节点无状态且轻量的三层（Layer-3�
 - **NAT 穿透** —— 基于 STUN 的地址发现与 UDP 打洞，跨 NAT 建立直连
 - **最低延迟选路** —— 对每条候选路径（局域网与公网）做 ping/pong RTT 探测，流量始终走最快的一条，切换带防抖
 - **自部署中继兜底** —— 无直连路径时回退到你自己的 derper 中继，由网络级 token 认证保护
+- **子网路由** —— Linux 节点可宣告 LAN 网段并为未安装 agent 的主机转发与 SNAT；所有平台都可以接受这些路由。详见 [docs/subnet-router.md](docs/subnet-router.md)
 - **跨平台** —— 支持 Linux、macOS 和 Windows
 
 ## 初衷
@@ -211,7 +212,7 @@ cargo build --release -p noeio
 ## Roadmap
 
 - [ ] `NoeioPacket` 的零拷贝改造
-- [ ] 子路由支持
+- [x] 子网路由支持（Linux 宣告方，见 [docs/subnet-router.md](docs/subnet-router.md)）
 - [ ] 多虚拟网络支持
 
 ## License
