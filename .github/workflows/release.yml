@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  # Allows re-running a release by hand if a merge-triggered run failed.
+  workflow_dispatch:
+
+# Never let two releases race to create the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # version.txt is the single source of truth; a merge only releases when it
+  # names a version that has not been tagged yet.
+  check:
+    name: Decide whether to release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check versions are in sync
+        run: ./version.sh -c -s
+
+      - id: decide
+        run: |
+          version="$(cat version.txt)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "Tag v$version already exists, skipping release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Releasing v$version."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Linux and Windows come out of the cross-compilation image, exactly as
+  # `make binaries` produces them locally.
+  linux-windows:
+    name: Build linux and windows
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binaries
+        run: make binaries PLATFORMS="linux-amd64 linux-arm64 windows-amd64"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-windows
+          path: build/out/noeio-*
+          if-no-files-found: error
+
+  # macOS cannot use that image: the SDK is bind-mounted from the host by
+  # scripts/build-binaries.sh, and GitHub's macOS runners have no Docker
+  # daemon. Build both arches natively against the runner's own SDK instead.
+  macos:
+    name: Build macos
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-latest
+    env:
+      # Matches build/cross/Dockerfile so both paths target the same floor.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: |
+          mkdir -p build/out
+          for pair in macos-amd64:x86_64-apple-darwin \
+                      macos-aarch64:aarch64-apple-darwin; do
+            platform="${pair%%:*}"
+            target="${pair##*:}"
+            echo "==> Building $platform ($target)"
+            cargo build --release -p noeio --bin noeio --target "$target"
+            cp "target/$target/release/noeio" "build/out/noeio-$platform"
+          done
+          cd build/out
+          for artifact in noeio-macos-*; do
+            shasum -a 256 "$artifact" > "$artifact.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-macos
+          path: build/out/noeio-*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [check, linux-windows, macos]
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: dist
+        run: |
+          ls -l
+          shasum -a 256 -c ./*.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes \
+            dist/noeio-*
